@@ -1,10 +1,30 @@
 import torch
 from torchvision import datasets, transforms
 import numpy as np
-import copy
+from torch.utils.data import Subset
 
+def load_mnist(data_dir='./data', train_fraction=1.0):
+    def stratified_split(dataset, fraction, seed=42):
+        """分层采样，保持各类别比例不变"""
+        # 按标签分组
+        label_to_indices = {}
+        for idx, (_, label) in enumerate(dataset):
+            if label not in label_to_indices:
+                label_to_indices[label] = []
+            label_to_indices[label].append(idx)
 
-def load_mnist(data_dir='./data'):
+        # 每个类别按比例采样
+        selected_indices = []
+        generator = torch.Generator().manual_seed(seed)
+
+        for label, indices in label_to_indices.items():
+            num_samples = int(len(indices) * fraction)
+            # 随机打乱后取前 num_samples 个
+            perm = torch.randperm(len(indices), generator=generator)
+            selected_indices.extend([indices[i] for i in perm[:num_samples]])
+
+        return Subset(dataset, selected_indices)
+
     """加载MNIST数据集"""
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -13,6 +33,9 @@ def load_mnist(data_dir='./data'):
 
     train_dataset = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+
+    if train_fraction < 1.0:
+        train_dataset = stratified_split(train_dataset, train_fraction)
 
     return train_dataset, test_dataset
 
