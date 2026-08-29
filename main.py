@@ -25,7 +25,7 @@ def main():
     LR_DECAY_EPOCH = 1               # 每1个epoch执行一次学习率衰减
     MOMENTUM = 0                     # 0 表示不使用动量
     WEIGHT_DECAY = 0                 # 权值衰减
-    TRAIN_FRACTION = 0.3              # 使用的训练集比例
+    TRAIN_FRACTION = 0.3              # 训练集的使用比例
     CLIENT_IID = False                # 客户端数据是否IID分布
     EDGE_IID = True                   # 边缘服务器数据是否IID分布
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -44,7 +44,7 @@ def main():
     print("="*50)
 
     # ==================== 加载数据 ====================
-    print("\n[1/6] 加载MNIST数据集...")
+    print(f"\n[1/6] 加载MNIST数据集...(训练集的使用比例:{TRAIN_FRACTION * 100}%)")
     train_dataset, test_dataset = load_mnist(train_fraction=TRAIN_FRACTION)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
