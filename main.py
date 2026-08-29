@@ -2,37 +2,45 @@ import torch
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'Microsoft YaHei']
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti SC', 'Hiragino Sans GB', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
 
 from models import get_model
 from data_utils import load_mnist, split_data_to_clients, create_data_loaders
-from client import Client
+from client import Client, DPConfig
 from edge_server import EdgeServer
 from cloud_server import CloudServer
 
 
 def main():
     # ==================== 配置参数 ====================
-    NUM_EDGES = 5                    # 边缘服务器数量
-    NUM_CLIENTS_PER_EDGE = 10         # 每个边缘服务器的客户端数量
+    NUM_EDGES = 5                         # 边缘服务器数量
+    NUM_CLIENTS_PER_EDGE = 10             # 每个边缘服务器的客户端数量
     NUM_CLIENTS = NUM_EDGES * NUM_CLIENTS_PER_EDGE  # 总客户端数量
-    NUM_ROUNDS = 100                  # 全局训练轮数
-    LOCAL_EPOCHS = 60                 # 客户端本地训练轮数
-    BATCH_SIZE = 20                  # 批次大小
-    LEARNING_RATE = 0.01             # 学习率
-    LR_DECAY = 0.995                 # 学习率衰减（gamma）
-    LR_DECAY_EPOCH = 1               # 每1个epoch执行一次学习率衰减
-    MOMENTUM = 0                     # 0 表示不使用动量
-    WEIGHT_DECAY = 0                 # 权值衰减
-    TRAIN_FRACTION = 0.3              # 训练集的使用比例
-    CLIENT_IID = False                # 客户端数据是否IID分布
-    EDGE_IID = True                   # 边缘服务器数据是否IID分布
+    NUM_ROUNDS = 100                      # 全局训练轮数
+    LOCAL_EPOCHS = 60                     # 客户端本地训练轮数
+    BATCH_SIZE = 20                       # 批次大小
+    LEARNING_RATE = 0.01                  # 初始学习率
+    LR_DECAY = 0.995                      # 学习率衰减系数（gamma）
+    LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
+    MOMENTUM = 0                          # SGD动量（0表示不使用动量）
+    WEIGHT_DECAY = 0                      # 权重衰减/L2正则化（0表示不使用）
+    TRAIN_FRACTION = 0.3                  # 训练集的使用比例（0.3=使用30%数据）
+    CLIENT_IID = False                    # 客户端数据是否IID分布
+    EDGE_IID = True                       # 边缘服务器数据是否IID分布
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    print("="*50)
-    print("简单分层联邦学习 (Simple Hierarchical FL)")
-    print("="*50)
+    # ==================== 差分隐私配置 ====================
+    USE_DP = True                         # 是否使用差分隐私
+    DP_EPSILON = 1.0                      # 隐私预算（越小隐私保护越强，典型值：0.1-10）
+    DP_DELTA = 1e-5                       # 失败概率（典型值：1e-5 到 1e-7）
+    DP_CLIP_C = 1.0                       # 梯度裁剪阈值
+    DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
+    DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
+
+    print("="*70)
+    print("分层联邦学习 + 差分隐私 (Hierarchical FL with Differential Privacy)")
+    print("="*70)
     print(f"设备: {DEVICE}")
     print(f"边缘服务器数量: {NUM_EDGES}")
     print(f"每个边缘服务器的客户端数量: {NUM_CLIENTS_PER_EDGE}")
@@ -41,10 +49,19 @@ def main():
     print(f"本地训练轮数: {LOCAL_EPOCHS}")
     print(f"客户端数据分布: {'IID' if CLIENT_IID else 'Non-IID'}")
     print(f"边缘服务器数据分布: {'IID' if EDGE_IID else 'Non-IID'}")
-    print("="*50)
+    print(f"\n{'='*70}")
+    print(f"差分隐私配置:")
+    print(f"  启用状态: {'是' if USE_DP else '否'}")
+    if USE_DP:
+        print(f"  隐私预算 ε: {DP_EPSILON}")
+        print(f"  失败概率 δ: {DP_DELTA}")
+        print(f"  梯度裁剪阈值: {DP_CLIP_C}")
+        print(f"  稀疏化率: {DP_RATE} (保留 {100/DP_RATE:.1f}% 的梯度)")
+        print(f"  噪声机制: {DP_MECHANISM}")
+    print("="*70)
 
     # ==================== 加载数据 ====================
-    print(f"\n[1/6] 加载MNIST数据集...(训练集的使用比例:{TRAIN_FRACTION * 100}%)")
+    print(f"\n[1/6] 加载MNIST数据集...(训练集使用比例: {TRAIN_FRACTION * 100}%)")
     train_dataset, test_dataset = load_mnist(train_fraction=TRAIN_FRACTION)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -53,6 +70,17 @@ def main():
     client_data_indices = split_data_to_clients(train_dataset, NUM_CLIENTS, NUM_EDGES,
                                                  client_iid=CLIENT_IID, edge_iid=EDGE_IID)
     client_loaders = create_data_loaders(train_dataset, client_data_indices, BATCH_SIZE)
+
+    # ==================== 初始化差分隐私配置 ====================
+    dp_config = None
+    if USE_DP:
+        dp_config = DPConfig(
+            epsilon=DP_EPSILON,
+            delta=DP_DELTA,
+            clip_C=DP_CLIP_C,
+            rate=DP_RATE,
+            mechanism=DP_MECHANISM
+        )
 
     # ==================== 初始化模型和服务器 ====================
     print("[3/6] 初始化云服务器、边缘服务器和客户端...")
@@ -85,9 +113,9 @@ def main():
     loss_history = []
 
     for round_idx in range(NUM_ROUNDS):
-        print(f"{'='*50}")
+        print(f"{'='*70}")
         print(f"轮次 {round_idx + 1}/{NUM_ROUNDS}")
-        print(f"{'='*50}")
+        print(f"{'='*70}")
 
         # 步骤1: 云服务器分发模型给边缘服务器
         cloud_server.distribute_model_to_edges()
@@ -105,12 +133,20 @@ def main():
             client_models = {}
             for client_id in edge_server.client_ids:
                 client = clients[client_id]
-                train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, LR_DECAY_EPOCH, LR_DECAY, MOMENTUM, WEIGHT_DECAY)
-                client_models[client_id] = client.get_model_parameters()
+
+                # 训练
+                train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY, LR_DECAY, LR_DECAY_EPOCH,
+                                         use_dp=USE_DP, dp_config=dp_config)
+
+                # 获取模型参数（如果使用DP，返回处理后的梯度）
+                client_models[client_id] = client.get_model_parameters(
+                    use_dp=USE_DP, dp_config=dp_config
+                )
+
                 print(f"  客户端 {client_id} 训练完成, 损失: {train_loss:.4f}")
 
             # 步骤4: 边缘服务器聚合客户端模型
-            edge_server.aggregate_client_models(client_models)
+            edge_server.aggregate_client_models(client_models, use_dp=USE_DP)
             edge_models[edge_server.edge_id] = edge_server.get_model_parameters()
             print(f"  边缘服务器 {edge_server.edge_id} 聚合完成")
 
@@ -128,9 +164,9 @@ def main():
         print(f"  测试损失: {test_loss:.4f}")
 
     # ==================== 训练完成 ====================
-    print(f"\n{'='*50}")
+    print(f"\n{'='*70}")
     print("训练完成!")
-    print(f"{'='*50}")
+    print(f"{'='*70}")
     print(f"最终测试准确率: {accuracy_history[-1]:.2f}%")
     print(f"最终测试损失: {loss_history[-1]:.4f}")
 
@@ -144,7 +180,8 @@ def main():
     plt.plot(range(1, NUM_ROUNDS + 1), accuracy_history, 'b-o', linewidth=2, markersize=6)
     plt.xlabel('轮次 (Round)', fontsize=12)
     plt.ylabel('准确率 (%)', fontsize=12)
-    plt.title('测试准确率变化', fontsize=14)
+    title_suffix = ' (with DP)' if USE_DP else ' (without DP)'
+    plt.title('测试准确率变化' + title_suffix, fontsize=14)
     plt.grid(True, alpha=0.3)
 
     # 绘制损失曲线
@@ -152,12 +189,13 @@ def main():
     plt.plot(range(1, NUM_ROUNDS + 1), loss_history, 'r-o', linewidth=2, markersize=6)
     plt.xlabel('轮次 (Round)', fontsize=12)
     plt.ylabel('损失 (Loss)', fontsize=12)
-    plt.title('测试损失变化', fontsize=14)
+    plt.title('测试损失变化' + title_suffix, fontsize=14)
     plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('training_results.png', dpi=150)
-    print("训练曲线已保存到 training_results.png")
+    filename = f'training_results_{"with_dp" if USE_DP else "without_dp"}.png'
+    plt.savefig(filename, dpi=150)
+    print(f"训练曲线已保存到 {filename}")
 
     print("\n[6/6] 完成!")
 
