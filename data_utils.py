@@ -3,6 +3,15 @@ from torchvision import datasets, transforms
 import numpy as np
 from torch.utils.data import Subset
 
+class SubsetWithClasses(Subset):
+    """带有classes属性的Subset，保持与原始数据集的兼容性"""
+
+    def __init__(self, dataset, indices):
+        super().__init__(dataset, indices)
+        # 继承原始数据集的classes属性
+        self.classes = dataset.classes if hasattr(dataset, 'classes') else list(range(10))
+
+
 def load_mnist(data_dir='./data', train_fraction=1.0):
     def stratified_split(dataset, fraction, seed=42):
         """分层采样，保持各类别比例不变"""
@@ -23,7 +32,7 @@ def load_mnist(data_dir='./data', train_fraction=1.0):
             perm = torch.randperm(len(indices), generator=generator)
             selected_indices.extend([indices[i] for i in perm[:num_samples]])
 
-        return Subset(dataset, selected_indices)
+        return SubsetWithClasses(dataset, selected_indices)
 
     """加载MNIST数据集"""
     transform = transforms.Compose([
@@ -56,7 +65,7 @@ def split_data_to_clients(train_dataset, num_clients, num_edges, client_iid=True
         client_data_indices: 字典，key为客户端ID，value为该客户端的数据索引列表
     """
     num_samples = len(train_dataset)
-    num_classes = len(train_dataset.classes)  # MNIST有10个类别
+    num_classes = len(train_dataset.classes) # MNIST有10个类别
     clients_per_edge = num_clients // num_edges
 
     # 获取所有样本的标签
