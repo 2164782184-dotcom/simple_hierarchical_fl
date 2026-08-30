@@ -230,7 +230,7 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
     流程：
     1. 将梯度裁剪到 [-clip_C, clip_C]
     2. 将选中的元素归一化到 [left, right]
-    3. 添加拉普拉斯噪声
+    3. 根据 mechanism 添加噪声（拉普拉斯或高斯）
     4. 反归一化回原始范围
     5. 未选中的元素置零
 
@@ -239,7 +239,7 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
         choices: 被选中的索引列表
         clip_C: 裁剪阈值
         eps: 隐私预算 epsilon
-        delta: 隐私参数 delta
+        delta: 隐私参数 delta（高斯机制必须提供）
         mechanism: 噪声机制（'gaussian' 或 'laplace'）
         device: 计算设备（'cpu' 或 torch.device 对象）
         left: 归一化后的左边界
@@ -266,8 +266,16 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
     # 步骤 3：归一化到 [left, right]
     normalized_elements = transform(chosen_elements, -clip_C, clip_C, left, right)
 
-    # 步骤 4：添加拉普拉斯噪声
-    noise = one_laplace(eps, right - left, normalized_elements)
+    # 步骤 4：根据 mechanism 添加噪声
+    if mechanism == 'laplace':
+        noise = one_laplace(eps, right - left, normalized_elements)
+    elif mechanism == 'gaussian':
+        # 高斯机制：σ = Δf * sqrt(2 * ln(1.25 / δ)) / ε
+        # 其中 Δf = right - left 为归一化后的敏感度
+        sigma = (right - left) * math.sqrt(2 * math.log(1.25 / delta)) / eps
+        noise = torch.normal(0, sigma, size=normalized_elements.shape).to(device)
+    else:
+        raise ValueError(f"不支持的噪声机制: {mechanism}，请使用 'laplace' 或 'gaussian'")
 
     # 步骤 5：加噪后反归一化回原始范围
     noisy_elements = normalized_elements + noise.to(device)
