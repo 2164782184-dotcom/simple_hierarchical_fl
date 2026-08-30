@@ -25,16 +25,16 @@ def main():
     LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
     MOMENTUM = 0                          # SGD动量（0表示不使用动量）
     WEIGHT_DECAY = 0                      # 权重衰减/L2正则化（0表示不使用）
-    TRAIN_FRACTION = 0.3                  # 训练集的使用比例（0.3=使用30%数据）
+    TRAIN_FRACTION = 0.01                 # 训练集的使用比例（0.3=使用30%数据）
     CLIENT_IID = False                    # 客户端数据是否IID分布
     EDGE_IID = True                       # 边缘服务器数据是否IID分布
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ==================== 差分隐私配置 ====================
     USE_DP = True                         # 是否使用差分隐私
-    DP_EPSILON = 1.0                      # 隐私预算（越小隐私保护越强，典型值：0.1-10）
-    DP_DELTA = 1e-5                       # 失败概率（典型值：1e-5 到 1e-7）
-    DP_CLIP_C = 1.0                       # 梯度裁剪阈值
+    DP_EPSILON = 0.5                      # 隐私预算（越小隐私保护越强，典型值：0.1-10）
+    DP_DELTA = 0.001                      # 失败概率（典型值：1e-5 到 1e-7）
+    DP_CLIP_C = 0.01                      # 梯度裁剪阈值
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
 
