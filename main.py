@@ -1,6 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti SC', 'Hiragino Sans GB', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
@@ -38,6 +40,9 @@ def main():
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
 
+    # ==================== TensorBoard配置 ====================
+    USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
+
     print("="*70)
     print("分层联邦学习 + 差分隐私 (Hierarchical FL with Differential Privacy)")
     print("="*70)
@@ -59,6 +64,19 @@ def main():
         print(f"  稀疏化率: {DP_RATE} (保留 {100/DP_RATE:.1f}% 的梯度)")
         print(f"  噪声机制: {DP_MECHANISM}")
     print("="*70)
+
+    # ==================== 初始化TensorBoard ====================
+    writer = None
+    if USE_TENSORBOARD:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_dir = f'runs/HierFL_{"DP" if USE_DP else "noDP"}_{timestamp}'
+        writer = SummaryWriter(log_dir)
+        print(f"\n{'='*70}")
+        print(f"TensorBoard 已启用")
+        print(f"  日志目录: {log_dir}")
+        print(f"  启动命令: tensorboard --logdir=runs")
+        print(f"  访问地址: http://localhost:6006")
+        print(f"{'='*70}")
 
     # ==================== 加载数据 ====================
     print(f"\n[1/6] 加载MNIST数据集...(训练集使用比例: {TRAIN_FRACTION * 100}%)")
@@ -121,6 +139,7 @@ def main():
         cloud_server.distribute_model_to_edges()
 
         edge_models = {}
+        round_client_losses = []  # 记录本轮所有客户端的损失
 
         # 对每个边缘服务器
         for edge_server in edge_servers:
@@ -144,6 +163,11 @@ def main():
                 )
 
                 print(f"  客户端 {client_id} 训练完成, 损失: {train_loss:.4f}")
+                round_client_losses.append(train_loss)
+
+                # TensorBoard: 记录每个客户端的训练损失
+                if writer:
+                    writer.add_scalar(f'Client/Loss_Client_{client_id}', train_loss, round_idx)
 
             # 步骤4: 边缘服务器聚合客户端模型
             edge_server.aggregate_client_models(client_models, use_dp=USE_DP)
@@ -154,14 +178,25 @@ def main():
         cloud_server.aggregate_edge_models(edge_models)
         print(f"\n云服务器聚合完成")
 
+        # 计算本轮平均客户端损失
+        avg_client_loss = sum(round_client_losses) / len(round_client_losses)
+
         # 步骤6: 评估全局模型
         accuracy, test_loss = cloud_server.evaluate(test_loader)
         accuracy_history.append(accuracy)
         loss_history.append(test_loss)
 
+        # TensorBoard: 记录全局指标
+        if writer:
+            writer.add_scalar('Global/Test_Accuracy', accuracy, round_idx)
+            writer.add_scalar('Global/Test_Loss', test_loss, round_idx)
+            writer.add_scalar('Global/Avg_Client_Train_Loss', avg_client_loss, round_idx)
+            writer.add_scalar('Hyperparameters/Learning_Rate', LEARNING_RATE * (LR_DECAY ** round_idx), round_idx)
+
         print(f"\n轮次 {round_idx + 1} 结果:")
         print(f"  测试准确率: {accuracy:.2f}%")
         print(f"  测试损失: {test_loss:.4f}")
+        print(f"  平均客户端训练损失: {avg_client_loss:.4f}")
 
     # ==================== 训练完成 ====================
     print(f"\n{'='*70}")
