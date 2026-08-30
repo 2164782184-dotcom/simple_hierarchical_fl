@@ -1,97 +1,59 @@
+"""
+云服务器模块
+========================================
+功能：
+1. 接收边缘服务器上传的模型
+2. 聚合边缘服务器模型（FedAvg）
+3. 下发全局模型到边缘服务器
+"""
+
 import torch
 import copy
+from models import LeNet
 
 
 class CloudServer:
     """云服务器类"""
 
-    def __init__(self, model, device='cpu'):
+    def __init__(self):
+        """初始化云服务器"""
+        self.model = LeNet()
+        self.edge_updates = {}  # 存储边缘服务器上传的模型
+
+    def receive_from_edgeserver(self, edge_id, eshared_state_dict):
         """
-        初始化云服务器
+        接收来自边缘服务器的模型
 
         Args:
-            model: 全局模型
-            device: 计算设备
+            edge_id: 边缘服务器ID
+            eshared_state_dict: 边缘服务器的模型参数
         """
-        self.model = model.to(device)
-        self.device = device
-        self.edge_servers = {}
+        self.edge_updates[edge_id] = eshared_state_dict
 
-    def register_edge_server(self, edge_server):
-        """注册边缘服务器"""
-        self.edge_servers[edge_server.edge_id] = edge_server
+    def aggregate(self):
+        """聚合所有边缘服务器的模型（FedAvg）"""
+        if len(self.edge_updates) == 0:
+            return
 
-    def distribute_model_to_edges(self):
-        """将全局模型分发给所有边缘服务器"""
-        for edge_id, edge_server in self.edge_servers.items():
-            edge_server.set_model(self.model)
-
-    def aggregate_edge_models(self, edge_models):
-        """
-        聚合边缘服务器模型参数（FedAvg算法）
-
-        Args:
-            edge_models: 字典，key为边缘服务器ID，value为模型参数
-
-        Returns:
-            聚合后的模型参数
-        """
-        if len(edge_models) == 0:
-            return self.model.state_dict()
-
-        # 初始化聚合后的参数
         aggregated_params = {}
+        num_edges = len(self.edge_updates)
 
         # 获取第一个边缘服务器的参数作为模板
-        first_edge_params = list(edge_models.values())[0]
+        first_edge_params = list(self.edge_updates.values())[0]
 
         # 对每个参数进行平均
         for key in first_edge_params.keys():
-            # 将所有边缘服务器的该参数相加
             aggregated_params[key] = torch.zeros_like(first_edge_params[key])
-            for edge_id, params in edge_models.items():
-                aggregated_params[key] += params[key]
-
-            # 取平均
-            aggregated_params[key] = aggregated_params[key] / len(edge_models)
+            for edge_params in self.edge_updates.values():
+                aggregated_params[key] += edge_params[key]
+            aggregated_params[key] = aggregated_params[key] / num_edges
 
         # 更新云服务器的全局模型
         self.model.load_state_dict(aggregated_params)
 
-        return aggregated_params
-
-    def evaluate(self, test_loader):
-        """
-        在测试集上评估全局模型
-
-        Args:
-            test_loader: 测试数据加载器
-
-        Returns:
-            准确率和损失
-        """
-        self.model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
-
-        criterion = torch.nn.CrossEntropyLoss()
-
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                test_loss += criterion(output, target).item()
-
-                pred = output.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
-                total += target.size(0)
-
-        test_loss /= len(test_loader)
-        accuracy = 100. * correct / total
-
-        return accuracy, test_loss
+        # 清空边缘服务器更新缓存
+        self.edge_updates = {}
 
     def get_model(self):
-        """返回全局模型"""
-        return self.model
+        """获取全局模型参数"""
+        return copy.deepcopy(self.model.state_dict())

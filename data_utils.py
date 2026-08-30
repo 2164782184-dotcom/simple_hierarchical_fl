@@ -226,31 +226,54 @@ def split_data_to_clients(train_dataset, num_clients, num_edges, client_iid=True
     return client_data_indices
 
 
-def create_data_loaders(train_dataset, client_data_indices, batch_size):
+def create_data_loaders(train_dataset, client_data_indices, batch_size, support_ratio=0.8):
     """
-    为每个客户端创建DataLoader
+    为每个客户端创建DataLoader（支持 support/query 划分）
 
     Args:
         train_dataset: 完整的训练数据集
         client_data_indices: 客户端数据索引字典
         batch_size: 批次大小
+        support_ratio: support 集占比（默认 0.8，即 80% support，20% query）
 
     Returns:
-        client_loaders: 字典，key为客户端ID，value为DataLoader
+        client_support_loaders: 字典，key为客户端ID，value为support DataLoader
+        client_query_loaders: 字典，key为客户端ID，value为query DataLoader
     """
-    client_loaders = {}
+    client_support_loaders = {}
+    client_query_loaders = {}
 
     for client_id, indices in client_data_indices.items():
-        subset = torch.utils.data.Subset(train_dataset, indices)
-        loader = torch.utils.data.DataLoader(
-            subset,
+        # 随机打乱索引
+        indices = np.array(indices)
+        np.random.shuffle(indices)
+
+        # 划分 support 和 query
+        split_point = int(len(indices) * support_ratio)
+        support_indices = indices[:split_point].tolist()
+        query_indices = indices[split_point:].tolist()
+
+        # 创建 support loader
+        support_subset = torch.utils.data.Subset(train_dataset, support_indices)
+        support_loader = torch.utils.data.DataLoader(
+            support_subset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=0
         )
-        client_loaders[client_id] = loader
+        client_support_loaders[client_id] = support_loader
 
-    return client_loaders
+        # 创建 query loader
+        query_subset = torch.utils.data.Subset(train_dataset, query_indices)
+        query_loader = torch.utils.data.DataLoader(
+            query_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0
+        )
+        client_query_loaders[client_id] = query_loader
+
+    return client_support_loaders, client_query_loaders
 
 
 def analyze_data_distribution(train_dataset, client_data_indices, num_edges, num_clients,description):
