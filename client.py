@@ -88,7 +88,8 @@ class Client:
     4. 与边缘服务器通信的缓冲区
     """
 
-    def __init__(self, client_id, support_loader, query_loader, test_loader, device):
+    def __init__(self, client_id, support_loader, query_loader, test_loader, device,
+                 train_inner_step=5, test_inner_step=5):
         """
         初始化客户端
 
@@ -98,6 +99,8 @@ class Client:
             query_loader: 查询集数据加载器（用于元学习的外层更新）
             test_loader: 测试集数据加载器
             device: 计算设备
+            train_inner_step: support集采样的batch数量（0表示遍历全部）
+            test_inner_step: query集采样的batch数量（0表示遍历全部）
         """
         self.id = client_id
         self.support_loader = support_loader
@@ -125,6 +128,16 @@ class Client:
 
         # 初始化外层 Adam 优化器
         self.outer_opt = Adam(lr=self.outer_lr)
+
+        # Mini-batch 采样配置
+        self.train_inner_step = train_inner_step
+        self.test_inner_step = test_inner_step
+
+        # 如果使用 mini-batch 模式，初始化迭代器
+        if self.is_train_mini_batch:
+            self.train_dataset_loader_iterator = iter(self.support_loader)
+        if self.is_test_mini_batch:
+            self.test_dataset_loader_iterator = iter(self.query_loader)
 
     def set_teacher_model(self, teacher_state_dict):
         """
@@ -192,14 +205,25 @@ class Client:
 
         # 进行 num_iter 次本地更新
         for iteration in range(num_iter):
-            # === 第一步：保存当前模型参数 ===
+            # === 第一步：确定数据加载器 ===
+            if self.is_train_mini_batch:
+                support_data_loader = self.gen_support_batches()
+            else:
+                support_data_loader = self.support_loader
+
+            if self.is_test_mini_batch:
+                query_data_loader = self.gen_query_batches()
+            else:
+                query_data_loader = self.query_loader
+
+            # === 第二步：保存当前模型参数 ===
             temp_model = copy.deepcopy(self.model.state_dict())
 
-            # === 第二步：在 Support 集上进行内层更新 ===
+            # === 第三步：在 Support 集上进行内层更新 ===
             loss_sum = 0.0
             support_num_samples = 0
 
-            for data in self.support_loader:
+            for data in support_data_loader:
                 inputs, labels = data
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 num_sample = labels.size(0)
@@ -228,11 +252,11 @@ class Client:
                 if p.grad is not None:
                     p.grad.zero_()
 
-            # === 第三步：在 Query 集上计算外层梯度 ===
+            # === 第四步：在 Query 集上计算外层梯度 ===
             query_loss_sum = 0.0
             query_num_samples = 0
 
-            for data in self.query_loader:
+            for data in query_data_loader:
                 inputs, labels = data
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 num_sample = labels.size(0)
@@ -392,3 +416,45 @@ class Client:
         将接收到的全局模型参数加载到本地模型
         """
         self.model.load_state_dict(self.receiver_buffer)
+
+    @property
+    def is_train_mini_batch(self):
+        """判断是否使用 mini-batch 训练模式"""
+        return self.train_inner_step > 0
+
+    @property
+    def is_test_mini_batch(self):
+        """判断是否使用 mini-batch 测试模式"""
+        return self.test_inner_step > 0
+
+    def gen_support_batches(self):
+        """
+        生成 support 集的 mini-batch
+
+        Yields:
+            data, target: 一个 mini-batch 的数据和标签
+        """
+        for i in range(self.train_inner_step):
+            try:
+                data, target = next(self.train_dataset_loader_iterator)
+            except StopIteration:
+                # 如果迭代器耗尽，重新创建
+                self.train_dataset_loader_iterator = iter(self.support_loader)
+                data, target = next(self.train_dataset_loader_iterator)
+            yield data, target
+
+    def gen_query_batches(self):
+        """
+        生成 query 集的 mini-batch
+
+        Yields:
+            data, target: 一个 mini-batch 的数据和标签
+        """
+        for i in range(self.test_inner_step):
+            try:
+                data, target = next(self.test_dataset_loader_iterator)
+            except StopIteration:
+                # 如果迭代器耗尽，重新创建
+                self.test_dataset_loader_iterator = iter(self.query_loader)
+                data, target = next(self.test_dataset_loader_iterator)
+            yield data, target
