@@ -190,7 +190,7 @@ def topindex(updates, topk):
     return indices.tolist()
 
 
-def local_process(flattened, args, dimension):
+def local_process(flattened, args, dimension, device):
     """
     客户端本地处理：稀疏化 + 加噪
 
@@ -214,10 +214,10 @@ def local_process(flattened, args, dimension):
     # 找出 top-k 索引
     choices = topindex(flattened, topk)
 
-    # 对选中的元素进行裁剪和加噪（强制使用 CPU）
+    # 对选中的元素进行裁剪和加噪
     vector = sampling_randomizer(
         flattened, choices, args.clip_C,
-        args.epsilon, args.delta, args.mechanism, 'cpu'
+        args.epsilon, args.delta, args.mechanism, device
     )
 
     return vector, choices

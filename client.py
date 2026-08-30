@@ -132,7 +132,7 @@ class Client:
         processed_gradient, choices = local_process(
             flattened_grad,
             dp_config,
-            dimension
+            dimension, self.device
         )
 
         return processed_gradient, choices, shapes
