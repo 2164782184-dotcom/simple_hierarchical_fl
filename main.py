@@ -40,11 +40,18 @@ def main():
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
 
+    # ==================== 知识蒸馏配置 ====================
+    USE_DISTILLATION = True               # 是否使用教师-学生互蒸馏
+    DISTILL_TEMPERATURE = 3.0             # 蒸馏温度（T），越大软标签越平滑（典型值：1-10）
+    DISTILL_ALPHA = 0.4                   # KL散度损失权重（典型值：0.3-0.7）
+    DISTILL_BETA = 0.3                    # MSE特征损失权重（典型值：0.1-0.4）
+    # 总损失 = (1-alpha-beta)*CE + alpha*KL + beta*MSE
+
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
 
     print("="*70)
-    print("分层联邦学习 + 差分隐私 (Hierarchical FL with Differential Privacy)")
+    print("分层联邦学习 + 差分隐私 + 互蒸馏 (HierFL + DP + Mutual Distillation)")
     print("="*70)
     print(f"设备: {DEVICE}")
     print(f"边缘服务器数量: {NUM_EDGES}")
@@ -63,6 +70,14 @@ def main():
         print(f"  梯度裁剪阈值: {DP_CLIP_C}")
         print(f"  稀疏化率: {DP_RATE} (保留 {100/DP_RATE:.1f}% 的梯度)")
         print(f"  噪声机制: {DP_MECHANISM}")
+    print(f"\n{'='*70}")
+    print(f"知识蒸馏配置:")
+    print(f"  启用状态: {'是' if USE_DISTILLATION else '否'}")
+    if USE_DISTILLATION:
+        print(f"  蒸馏温度 T: {DISTILL_TEMPERATURE}")
+        print(f"  KL散度损失权重 α: {DISTILL_ALPHA}")
+        print(f"  MSE特征损失权重 β: {DISTILL_BETA}")
+        print(f"  交叉熵损失权重: {1 - DISTILL_ALPHA - DISTILL_BETA:.2f}")
     print("="*70)
 
     # ==================== 初始化TensorBoard ====================
@@ -153,9 +168,20 @@ def main():
             for client_id in edge_server.client_ids:
                 client = clients[client_id]
 
+                # 如果使用知识蒸馏，设置教师模型（使用上一轮的全局模型）
+                if USE_DISTILLATION and round_idx > 0:
+                    client.set_teacher_model(cloud_server.get_model())
+
                 # 训练
-                train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY, LR_DECAY, LR_DECAY_EPOCH,
-                                         use_dp=USE_DP, dp_config=dp_config)
+                train_loss = client.train(
+                    LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                    LR_DECAY, LR_DECAY_EPOCH,
+                    use_dp=USE_DP, dp_config=dp_config,
+                    use_distillation=USE_DISTILLATION,
+                    temperature=DISTILL_TEMPERATURE,
+                    alpha=DISTILL_ALPHA,
+                    beta=DISTILL_BETA
+                )
 
                 # 获取模型参数（如果使用DP，返回处理后的梯度）
                 client_models[client_id] = client.get_model_parameters(
@@ -204,6 +230,11 @@ def main():
     print(f"{'='*70}")
     print(f"最终测试准确率: {accuracy_history[-1]:.2f}%")
     print(f"最终测试损失: {loss_history[-1]:.4f}")
+
+    # 关闭 TensorBoard writer
+    if writer:
+        writer.close()
+        print(f"\nTensorBoard 日志已保存")
 
     # ==================== 绘制结果 ====================
     print("\n[5/6] 绘制训练曲线...")
