@@ -293,6 +293,10 @@ class Client:
 
                     # 三组件组合损失：loss = (1-α-β)*CE + α*KL + β*MSE
                     loss = (1 - alpha - beta_feat) * ce_loss + alpha * kl_loss + beta_feat * feat_loss
+
+                    # 诊断：打印各损失分量（只在第一个batch打印，避免刷屏）
+                    if query_num_samples == 0 and iteration == 0:
+                        print(f"[客户端{self.client_id}] CE: {ce_loss.item():.4f}, KL: {kl_loss.item():.4f}, MSE: {feat_loss.item():.4f}, Total: {loss.item():.4f}")
                 else:
                     loss = ce_loss
 
