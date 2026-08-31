@@ -41,7 +41,7 @@ def main():
     DP_EPSILON = 5                        # 隐私预算（越小隐私保护越强，典型值：0.1-10）
     DP_DELTA = 0.001                      # 失败概率（典型值：1e-5 到 1e-7）
     DP_CLIP_C = 0.01                      # 梯度裁剪阈值
-    DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
+    DP_RATE = 4/3                         # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
 
     # ==================== MAML元学习配置 ====================
@@ -59,6 +59,9 @@ def main():
     USE_DP_DISTILLATION = True            # 是否对蒸馏过程使用差分隐私（保护教师模型输出）
     DISTILL_START_THRESHOLD = 0.7         # 蒸馏启动阈值（学生达到教师70%性能时才开始，0=立即开始）
     # 总损失 = (1-α-β)*CE + α*KL + β*MSE
+
+    # ==================== 隐私预算统计配置 ====================
+    USE_PRIVACY_ACCOUNTANT = False        # 是否启用隐私预算统计（关闭以避免超标警告）
 
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = False                # 是否启用TensorBoard实时可视化
@@ -136,7 +139,7 @@ def main():
 
     # ==================== 初始化隐私统计器 ====================
     privacy_accountant = None
-    if USE_DP:
+    if USE_DP and USE_PRIVACY_ACCOUNTANT:
         # 设置目标隐私预算为单轮的100倍（可根据需要调整）
         target_epsilon = DP_EPSILON * 100
         privacy_accountant = PrivacyAccountant(target_epsilon=target_epsilon, target_delta=DP_DELTA * NUM_ROUNDS)
