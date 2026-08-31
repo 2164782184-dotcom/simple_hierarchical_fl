@@ -12,6 +12,7 @@ from data_utils import load_mnist, split_data_to_clients, create_data_loaders
 from client import Client, DPConfig
 from edge_server import EdgeServer
 from cloud_server import CloudServer
+from privacy_accountant import PrivacyAccountant
 
 
 def main():
@@ -125,6 +126,19 @@ def main():
         print(f"  日志目录: {log_dir}")
         print(f"  启动命令: tensorboard --logdir=runs")
         print(f"  访问地址: http://localhost:6006")
+        print(f"{'='*70}")
+
+    # ==================== 初始化隐私统计器 ====================
+    privacy_accountant = None
+    if USE_DP:
+        # 设置目标隐私预算为单轮的10倍（可根据需要调整）
+        target_epsilon = DP_EPSILON * 10
+        privacy_accountant = PrivacyAccountant(target_epsilon=target_epsilon, target_delta=DP_DELTA * NUM_ROUNDS)
+        print(f"\n{'='*70}")
+        print(f"隐私预算统计已启用")
+        print(f"  目标总隐私预算 ε: {target_epsilon}")
+        print(f"  单轮隐私预算 ε: {DP_EPSILON}")
+        print(f"  预计可训练轮数: ~{target_epsilon / DP_EPSILON:.0f} 轮")
         print(f"{'='*70}")
 
     # ==================== 加载数据 ====================
@@ -310,12 +324,38 @@ def main():
         print(f"  测试损失: {test_loss:.4f}")
         print(f"  平均客户端训练损失: {avg_client_loss:.4f}")
 
+        # 记录隐私消耗
+        if privacy_accountant is not None:
+            privacy_accountant.add_round(
+                round_num=round_idx + 1,
+                epsilon=DP_EPSILON,
+                delta=DP_DELTA,
+                num_clients=int(NUM_CLIENTS * FRAC)
+            )
+
+            # 每10轮或最后一轮打印隐私报告
+            if (round_idx + 1) % 10 == 0 or round_idx == NUM_ROUNDS - 1:
+                print(f"\n{privacy_accountant.get_privacy_report()}")
+
+            # 检查隐私预算
+            is_safe, warning = privacy_accountant.check_privacy_budget()
+            if not is_safe:
+                print(f"\n{warning}")
+                print("⚠️  隐私预算耗尽，提前终止训练！")
+                break
+
     # ==================== 训练完成 ====================
     print(f"\n{'='*70}")
     print("训练完成!")
     print(f"{'='*70}")
     print(f"最终测试准确率: {accuracy_history[-1]:.2f}%")
     print(f"最终测试损失: {loss_history[-1]:.4f}")
+
+    # 保存隐私统计历史
+    if privacy_accountant is not None:
+        print(f"\n{privacy_accountant.get_privacy_report()}")
+        privacy_accountant.save_history('privacy_history.json')
+        print(f"\n隐私统计历史已保存到: privacy_history.json")
 
     # ==================== 绘制结果 ====================
     print("\n[5/6] 绘制训练曲线...")
