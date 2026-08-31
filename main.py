@@ -28,9 +28,11 @@ def main():
     LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
     MOMENTUM = 0                          # SGD动量（0表示不使用动量）
     WEIGHT_DECAY = 0                      # 权重衰减/L2正则化（0表示不使用）
-    TRAIN_FRACTION = 0.01                 # 训练集的使用比例（0.3=使用30%数据）
+    TRAIN_FRACTION = 0.01                 # 训练集的使用比例（0.01=使用1%数据）
     CLIENT_IID = False                    # 客户端数据是否IID分布
     EDGE_IID = True                       # 边缘服务器数据是否IID分布
+    FRAC = 1.0                            # 每轮参与训练的客户端比例（1.0=全部参与）
+    SEED = 42                             # 随机种子（用于实验可复现性）
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ==================== 差分隐私配置 ====================
@@ -43,7 +45,7 @@ def main():
 
     # ==================== MAML元学习配置 ====================
     USE_MAML = True                       # 是否使用MAML元学习
-    SUPPORT_RATIO = 0.8                   # support集占比（0.8 = 80% support, 20% query）
+    SUPPORT_RATIO = 0.5                   # support集占比（0.8 = 80% support, 20% query）
     BETA = 0.001                          # MAML外层学习率（Adam优化器）
     TRAIN_INNER_STEP = 5                  # support集采样batch数（0=遍历全部，>0=采样指定数量batch）
     TEST_INNER_STEP = 5                   # query集采样batch数（0=遍历全部，>0=采样指定数量batch）
@@ -58,6 +60,18 @@ def main():
 
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
+
+    # ==================== 设置随机种子 ====================
+    import random
+    import numpy as np
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     print("="*70)
     print("分层联邦学习 + 差分隐私 + MAML + KL蒸馏")
@@ -210,9 +224,21 @@ def main():
             # 步骤2: 边缘服务器分发模型给客户端
             edge_server.distribute_model_to_clients()
 
+            # 客户端采样：根据 FRAC 比例随机选择参与训练的客户端
+            all_client_ids = edge_server.client_ids
+            num_selected = max(1, int(len(all_client_ids) * FRAC))
+            selected_client_ids = np.random.choice(
+                all_client_ids,
+                num_selected,
+                replace=False
+            ).tolist()
+
+            if FRAC < 1.0:
+                print(f"  客户端采样: {num_selected}/{len(all_client_ids)} 个客户端参与训练")
+
             # 步骤3: 客户端本地训练
             client_models = {}
-            for client_id in edge_server.client_ids:
+            for client_id in selected_client_ids:  # 只训练被选中的客户端
                 client = clients[client_id]
 
                 # 设置教师模型（用于KL蒸馏，从第2轮开始）
