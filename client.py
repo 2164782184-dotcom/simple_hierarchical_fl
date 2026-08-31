@@ -122,7 +122,7 @@ class Client:
     def train(self, epochs, learning_rate, momentum=0, weight_decay=0,
               lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None,
               use_maml=False, beta=0.001, use_distillation=False,
-              temperature=3.0, alpha=0.5):
+              temperature=3.0, alpha=0.5, beta_feat=0.3, use_dp_distillation=False):
         """
         在本地数据上训练模型（支持标准训练和MAML元学习）
 
@@ -133,13 +133,15 @@ class Client:
             weight_decay: 权重衰减/L2正则化系数（0表示不使用）
             lr_decay: 学习率衰减系数
             lr_decay_epoch: 每多少轮衰减一次学习率
-            use_dp: 是否使用差分隐私
+            use_dp: 是否使用差分隐私（用于梯度上传）
             dp_config: 差分隐私配置参数
             use_maml: 是否使用MAML元学习
             beta: MAML外层学习率
             use_distillation: 是否使用KL蒸馏
             temperature: KL蒸馏温度参数
             alpha: KL蒸馏损失权重
+            beta_feat: 特征蒸馏损失权重（MSE）
+            use_dp_distillation: 是否对蒸馏过程使用差分隐私
 
         Returns:
             avg_loss: 平均训练损失
@@ -150,7 +152,8 @@ class Client:
         # 根据是否使用MAML选择训练方法
         if use_maml and self.support_loader and self.query_loader:
             return self._train_maml(epochs, learning_rate, beta,
-                                   use_distillation, temperature, alpha)
+                                   use_distillation, temperature, alpha, beta_feat,
+                                   use_dp_distillation, dp_config)
         else:
             return self._train_standard(epochs, learning_rate, momentum,
                                        weight_decay, lr_decay, lr_decay_epoch)
@@ -194,10 +197,12 @@ class Client:
         return avg_loss
 
     def _train_maml(self, num_iter, inner_lr, outer_lr,
-                   use_distillation, temperature, alpha):
-        """MAML元学习训练方法"""
+                   use_distillation, temperature, alpha, beta_feat,
+                   use_dp_distillation, dp_config):
+        """MAML元学习训练方法（支持三组件互蒸馏：CE + KL + MSE + 蒸馏差分隐私）"""
         self.model.train()
         criterion = nn.CrossEntropyLoss()
+        mse_criterion = nn.MSELoss()
 
         # 初始化外层Adam优化器
         if self.outer_opt is None:
@@ -251,7 +256,7 @@ class Client:
                 if p.grad is not None:
                     p.grad.zero_()
 
-            # === 外层更新：在query集上元学习 ===
+            # === 外层更新：在query集上元学习 + 三组件互蒸馏 ===
             query_loss_sum = 0.0
             query_num_samples = 0
 
@@ -259,16 +264,35 @@ class Client:
                 data, target = data.to(self.device), target.to(self.device)
                 num_sample = target.size(0)
 
-                student_output = self.model(data)
+                # 学生模型前向传播（获取logits和特征）
+                if use_distillation and self.teacher_model is not None:
+                    student_output, student_features = self.model(data, return_features=True)
+                else:
+                    student_output = self.model(data, return_features=False)
+
+                # 1. 交叉熵损失（硬标签）
                 ce_loss = criterion(student_output, target)
 
-                # KL蒸馏
+                # 2. KL散度 + 3. 特征MSE（如果启用蒸馏）
                 if use_distillation and self.teacher_model is not None:
                     with torch.no_grad():
-                        teacher_output = self.teacher_model(data)
+                        teacher_output, teacher_features = self.teacher_model(data, return_features=True)
 
+                        # 对教师模型的输出添加差分隐私噪声
+                        if use_dp_distillation and dp_config is not None:
+                            teacher_output = self._add_noise_to_teacher_output(teacher_output, dp_config)
+                            teacher_features['fc2'] = self._add_noise_to_teacher_features(
+                                teacher_features['fc2'], dp_config
+                            )
+
+                    # KL散度损失（软标签）
                     kl_loss = self._compute_kl_loss(student_output, teacher_output, temperature)
-                    loss = (1 - alpha) * ce_loss + alpha * kl_loss
+
+                    # 特征MSE损失（使用fc2层特征，通常是最后一个隐藏层）
+                    feat_loss = mse_criterion(student_features['fc2'], teacher_features['fc2'])
+
+                    # 三组件组合损失：loss = (1-α-β)*CE + α*KL + β*MSE
+                    loss = (1 - alpha - beta_feat) * ce_loss + alpha * kl_loss + beta_feat * feat_loss
                 else:
                     loss = ce_loss
 
@@ -305,6 +329,68 @@ class Client:
         teacher_soft = F.softmax(teacher_logits / temperature, dim=1)
         kl_loss = F.kl_div(student_soft, teacher_soft, reduction='batchmean')
         return kl_loss * (temperature ** 2)
+
+    def _add_noise_to_teacher_output(self, teacher_output, dp_config):
+        """
+        对教师模型的输出logits添加拉普拉斯噪声
+
+        Args:
+            teacher_output: 教师模型的logits (batch, num_classes)
+            dp_config: 差分隐私配置
+
+        Returns:
+            加噪后的teacher_output
+        """
+        if dp_config.mechanism == 'laplace':
+            # 拉普拉斯噪声：scale = sensitivity / epsilon
+            # 对于logits，sensitivity可以设为一个较小的值
+            sensitivity = 1.0
+            scale = sensitivity / dp_config.epsilon
+            noise = torch.from_numpy(
+                np.random.laplace(0, scale, teacher_output.shape)
+            ).float().to(self.device)
+        elif dp_config.mechanism == 'gaussian':
+            # 高斯噪声
+            sensitivity = 1.0
+            sigma = sensitivity * np.sqrt(2 * np.log(1.25 / dp_config.delta)) / dp_config.epsilon
+            noise = torch.randn_like(teacher_output) * sigma
+        else:
+            noise = 0
+
+        return teacher_output + noise
+
+    def _add_noise_to_teacher_features(self, teacher_features, dp_config):
+        """
+        对教师模型的特征添加拉普拉斯噪声
+
+        Args:
+            teacher_features: 教师模型的特征 (batch, feature_dim)
+            dp_config: 差分隐私配置
+
+        Returns:
+            加噪后的特征
+        """
+        # 先对特征进行L2范数裁剪
+        feature_norm = torch.norm(teacher_features, p=2, dim=1, keepdim=True)
+        clipped_features = teacher_features * torch.clamp(
+            dp_config.clip_C / (feature_norm + 1e-8), max=1.0
+        )
+
+        # 添加噪声
+        if dp_config.mechanism == 'laplace':
+            sensitivity = dp_config.clip_C
+            scale = sensitivity / dp_config.epsilon
+            noise = torch.from_numpy(
+                np.random.laplace(0, scale, clipped_features.shape)
+            ).float().to(self.device)
+        elif dp_config.mechanism == 'gaussian':
+            sensitivity = dp_config.clip_C
+            sigma = sensitivity * np.sqrt(2 * np.log(1.25 / dp_config.delta)) / dp_config.epsilon
+            noise = torch.randn_like(clipped_features) * sigma
+        else:
+            noise = 0
+
+        return clipped_features + noise
 
     def get_model_parameters(self, use_dp=False, dp_config=None):
         """

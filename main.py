@@ -51,7 +51,10 @@ def main():
     # ==================== 知识蒸馏配置 ====================
     USE_DISTILLATION = True               # 是否使用KL蒸馏
     DISTILL_TEMPERATURE = 3.0             # 蒸馏温度参数
-    DISTILL_ALPHA = 0.4                   # KL损失权重（loss = (1-α)*CE + α*KL）
+    DISTILL_ALPHA = 0.4                   # KL损失权重（软标签）
+    DISTILL_BETA = 0.3                    # MSE损失权重（特征层）
+    USE_DP_DISTILLATION = True            # 是否对蒸馏过程使用差分隐私（保护教师模型输出）
+    # 总损失 = (1-α-β)*CE + α*KL + β*MSE
 
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
@@ -224,7 +227,9 @@ def main():
                     use_maml=USE_MAML, beta=BETA,
                     use_distillation=USE_DISTILLATION,
                     temperature=DISTILL_TEMPERATURE,
-                    alpha=DISTILL_ALPHA
+                    alpha=DISTILL_ALPHA,
+                    beta_feat=DISTILL_BETA,
+                    use_dp_distillation=USE_DP_DISTILLATION
                 )
 
                 # 获取模型参数（如果使用DP，返回处理后的梯度）
