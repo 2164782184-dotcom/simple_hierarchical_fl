@@ -360,11 +360,14 @@ def main():
     # ==================== 绘制结果 ====================
     print("\n[5/6] 绘制训练曲线...")
 
+    # 使用实际训练的轮数
+    actual_rounds = len(accuracy_history)
+
     plt.figure(figsize=(12, 5))
 
     # 绘制准确率曲线
     plt.subplot(1, 2, 1)
-    plt.plot(range(1, NUM_ROUNDS + 1), accuracy_history, 'b-o', linewidth=2, markersize=6)
+    plt.plot(range(1, actual_rounds + 1), accuracy_history, 'b-o', linewidth=2, markersize=6)
     plt.xlabel('轮次 (Round)', fontsize=12)
     plt.ylabel('准确率 (%)', fontsize=12)
     title_suffix = ' (with DP)' if USE_DP else ' (without DP)'
@@ -373,7 +376,7 @@ def main():
 
     # 绘制损失曲线
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, NUM_ROUNDS + 1), loss_history, 'r-o', linewidth=2, markersize=6)
+    plt.plot(range(1, actual_rounds + 1), loss_history, 'r-o', linewidth=2, markersize=6)
     plt.xlabel('轮次 (Round)', fontsize=12)
     plt.ylabel('损失 (Loss)', fontsize=12)
     plt.title('测试损失变化' + title_suffix, fontsize=14)
@@ -382,7 +385,7 @@ def main():
     plt.tight_layout()
     filename = f'training_results_{"with_dp" if USE_DP else "without_dp"}.png'
     plt.savefig(filename, dpi=150)
-    print(f"训练曲线已保存到 {filename}")
+    print(f"训练曲线已保存到 {filename} (实际训练 {actual_rounds}/{NUM_ROUNDS} 轮)")
 
     print("\n[6/6] 完成!")
 
