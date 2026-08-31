@@ -230,8 +230,9 @@ def main():
     loss_history = []
 
     # 自适应蒸馏相关变量
-    distillation_enabled = False  # 蒸馏是否已启动
-    teacher_accuracy = 0.0        # 教师模型的性能基准
+    distillation_enabled = False      # 蒸馏是否已启动
+    best_accuracy = 0.0               # 历史最佳准确率（作为教师基准）
+    rounds_since_improvement = 0      # 自上次提升以来的轮数
 
     # 动态权重调整器（每个客户端一个）
     weight_adjusters = {}
@@ -293,13 +294,17 @@ def main():
                     elif distillation_enabled:
                         # 已经启动过蒸馏，继续使用
                         use_distillation_this_round = True
-                    elif len(accuracy_history) > 0:
-                        # 检查当前学生模型是否达到阈值
-                        current_accuracy = accuracy_history[-1]
-                        if current_accuracy >= teacher_accuracy * DISTILL_START_THRESHOLD:
+                    elif len(accuracy_history) >= 2:
+                        # 检查模型是否在稳定提升（连续两轮准确率都在增长）
+                        # 说明模型已经有一定质量，可以作为教师
+                        prev_acc = accuracy_history[-2]
+                        curr_acc = accuracy_history[-1]
+
+                        # 如果当前准确率达到历史最佳的阈值比例，启动蒸馏
+                        if curr_acc >= best_accuracy * DISTILL_START_THRESHOLD and curr_acc > prev_acc:
                             distillation_enabled = True
                             use_distillation_this_round = True
-                            print(f"\n🎓 蒸馏已启动！学生性能: {current_accuracy:.2f}% ≥ {DISTILL_START_THRESHOLD:.0%} × 教师性能: {teacher_accuracy:.2f}%")
+                            print(f"\n🎓 蒸馏已启动！当前性能: {curr_acc:.2f}% ≥ {DISTILL_START_THRESHOLD:.0%} × 历史最佳: {best_accuracy:.2f}%")
 
                     # 设置教师模型
                     if use_distillation_this_round:
@@ -348,8 +353,12 @@ def main():
         accuracy_history.append(accuracy)
         loss_history.append(test_loss)
 
-        # 更新教师模型性能基准（用于自适应蒸馏）
-        teacher_accuracy = accuracy
+        # 更新历史最佳准确率（用于自适应蒸馏）
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            rounds_since_improvement = 0
+        else:
+            rounds_since_improvement += 1
 
         # TensorBoard: 记录全局指标
         if writer:
@@ -364,7 +373,8 @@ def main():
         print(f"  测试损失: {test_loss:.4f}")
         print(f"  平均客户端训练损失: {avg_client_loss:.4f}")
         if USE_DISTILLATION and DISTILL_START_THRESHOLD > 0:
-            print(f"  蒸馏状态: {'✓ 已启动' if distillation_enabled else f'等待中 (需达到 {teacher_accuracy * DISTILL_START_THRESHOLD:.2f}%)'}")
+            status = '✓ 已启动' if distillation_enabled else f'等待中 (当前: {accuracy:.2f}%, 需达到: {best_accuracy * DISTILL_START_THRESHOLD:.2f}%)'
+            print(f"  蒸馏状态: {status}")
 
         # 记录隐私消耗
         if privacy_accountant is not None:
