@@ -20,6 +20,7 @@ def main():
     NUM_CLIENTS_PER_EDGE = 10             # 每个边缘服务器的客户端数量
     NUM_CLIENTS = NUM_EDGES * NUM_CLIENTS_PER_EDGE  # 总客户端数量
     NUM_ROUNDS = 100                      # 全局训练轮数
+    NUM_EDGE_AGGREGATION = 1              # 边缘聚合次数（每次云聚合前，边缘进行多少轮本地聚合）
     LOCAL_EPOCHS = 60                     # 客户端本地训练轮数
     BATCH_SIZE = 20                       # 批次大小
     LEARNING_RATE = 0.01                  # 初始学习率
@@ -182,13 +183,19 @@ def main():
     accuracy_history = []
     loss_history = []
 
+    # 云轮次计数器
+    cloud_round = 0
+
     for round_idx in range(NUM_ROUNDS):
         print(f"{'='*70}")
         print(f"轮次 {round_idx + 1}/{NUM_ROUNDS}")
         print(f"{'='*70}")
 
-        # 步骤1: 云服务器分发模型给边缘服务器
-        cloud_server.distribute_model_to_edges()
+        # 步骤1: 云服务器分发模型给边缘服务器（每 NUM_EDGE_AGGREGATION 轮执行一次）
+        if round_idx % NUM_EDGE_AGGREGATION == 0:
+            cloud_server.distribute_model_to_edges()
+            if NUM_EDGE_AGGREGATION > 1:
+                print(f"云服务器轮次 {cloud_round + 1}, 开始边缘聚合阶段 ({NUM_EDGE_AGGREGATION}轮)")
 
         edge_models = {}
         round_client_losses = []  # 记录本轮所有客户端的损失
@@ -236,6 +243,13 @@ def main():
             edge_server.aggregate_client_models(client_models, use_dp=USE_DP)
             edge_models[edge_server.edge_id] = edge_server.get_model_parameters()
             print(f"  边缘服务器 {edge_server.edge_id} 聚合完成")
+
+        # 步骤5: 每 NUM_EDGE_AGGREGATION 轮执行一次云聚合
+        if (round_idx + 1) % NUM_EDGE_AGGREGATION == 0:
+            # 云服务器聚合边缘服务器模型
+            cloud_server.aggregate_edge_models(edge_models)
+            print(f"\n云服务器聚合完成 (边缘聚合轮次: {(round_idx % NUM_EDGE_AGGREGATION) + 1}/{NUM_EDGE_AGGREGATION})")
+            cloud_round += 1
 
         # 步骤5: 云服务器聚合边缘服务器模型
         cloud_server.aggregate_edge_models(edge_models)
