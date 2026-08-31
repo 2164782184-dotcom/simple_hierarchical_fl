@@ -24,12 +24,12 @@ def main():
     NUM_EDGE_AGGREGATION = 1              # 边缘聚合次数（每次云聚合前，边缘进行多少轮本地聚合）
     LOCAL_EPOCHS = 60                     # 客户端本地训练轮数
     BATCH_SIZE = 64                       # 批次大小（GPU优化：64适合中等数据集）
-    LEARNING_RATE = 0.01                  # 初始学习率
+    LEARNING_RATE = 0.001                 # 初始学习率
     LR_DECAY = 0.995                      # 学习率衰减系数（gamma）
     LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
     MOMENTUM = 0                          # SGD动量（0表示不使用动量）
     WEIGHT_DECAY = 0                      # 权重衰减/L2正则化（0表示不使用）
-    TRAIN_FRACTION = 0.5                  # 训练集的使用比例（0.5=使用50%数据，增加以提高GPU利用率）
+    TRAIN_FRACTION = 1                    # 训练集的使用比例（1.0=使用100%数据）
     CLIENT_IID = False                    # 客户端数据是否IID分布
     EDGE_IID = True                       # 边缘服务器数据是否IID分布
     FRAC = 1.0                            # 每轮参与训练的客户端比例（1.0=全部参与）
@@ -38,7 +38,7 @@ def main():
 
     # ==================== 差分隐私配置 ====================
     USE_DP = True                         # 是否使用差分隐私
-    DP_EPSILON = 0.5                      # 隐私预算（越小隐私保护越强，典型值：0.1-10）
+    DP_EPSILON = 5                        # 隐私预算（越小隐私保护越强，典型值：0.1-10）
     DP_DELTA = 0.001                      # 失败概率（典型值：1e-5 到 1e-7）
     DP_CLIP_C = 0.01                      # 梯度裁剪阈值
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
@@ -46,7 +46,7 @@ def main():
 
     # ==================== MAML元学习配置 ====================
     USE_MAML = True                       # 是否使用MAML元学习
-    SUPPORT_RATIO = 0.5                   # support集占比（0.8 = 80% support, 20% query）
+    SUPPORT_RATIO = 0.8                   # support集占比（0.8 = 80% support, 20% query）
     BETA = 0.001                          # MAML外层学习率（Adam优化器）
     TRAIN_INNER_STEP = 5                  # support集采样batch数（0=遍历全部，>0=采样指定数量batch）
     TEST_INNER_STEP = 5                   # query集采样batch数（0=遍历全部，>0=采样指定数量batch）
@@ -55,12 +55,13 @@ def main():
     USE_DISTILLATION = True               # 是否使用KL蒸馏
     DISTILL_TEMPERATURE = 3.0             # 蒸馏温度参数
     DISTILL_ALPHA = 0.4                   # KL损失权重（软标签）
-    DISTILL_BETA = 0.3                    # MSE损失权重（特征层）
+    DISTILL_BETA = 0.2                    # MSE损失权重（特征层）
     USE_DP_DISTILLATION = True            # 是否对蒸馏过程使用差分隐私（保护教师模型输出）
+    DISTILL_START_THRESHOLD = 0.7         # 蒸馏启动阈值（学生达到教师70%性能时才开始，0=立即开始）
     # 总损失 = (1-α-β)*CE + α*KL + β*MSE
 
     # ==================== TensorBoard配置 ====================
-    USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
+    USE_TENSORBOARD = False                # 是否启用TensorBoard实时可视化
 
     # ==================== 设置随机种子 ====================
     import random
@@ -75,7 +76,7 @@ def main():
         torch.backends.cudnn.benchmark = False
 
     print("="*70)
-    print("分层联邦学习 + 差分隐私 + MAML + KL蒸馏")
+    print("分层联邦学习 + 差分隐私 + MAML + 自适应KL蒸馏")
     print("="*70)
     print(f"设备: {DEVICE}")
     if torch.cuda.is_available():
@@ -104,6 +105,11 @@ def main():
     if USE_DISTILLATION:
         print(f"  温度参数: {DISTILL_TEMPERATURE}")
         print(f"  KL损失权重α: {DISTILL_ALPHA}")
+        print(f"  MSE损失权重β: {DISTILL_BETA}")
+        if DISTILL_START_THRESHOLD > 0:
+            print(f"  自适应启动: 学生达到教师{DISTILL_START_THRESHOLD:.0%}性能后启动")
+        else:
+            print(f"  自适应启动: 关闭（第2轮立即开始）")
     print(f"\n{'='*70}")
     print(f"差分隐私配置:")
     print(f"  启用状态: {'是' if USE_DP else '否'}")
@@ -131,8 +137,8 @@ def main():
     # ==================== 初始化隐私统计器 ====================
     privacy_accountant = None
     if USE_DP:
-        # 设置目标隐私预算为单轮的10倍（可根据需要调整）
-        target_epsilon = DP_EPSILON * 10
+        # 设置目标隐私预算为单轮的100倍（可根据需要调整）
+        target_epsilon = DP_EPSILON * 100
         privacy_accountant = PrivacyAccountant(target_epsilon=target_epsilon, target_delta=DP_DELTA * NUM_ROUNDS)
         print(f"\n{'='*70}")
         print(f"隐私预算统计已启用")
@@ -218,6 +224,10 @@ def main():
     accuracy_history = []
     loss_history = []
 
+    # 自适应蒸馏相关变量
+    distillation_enabled = False  # 蒸馏是否已启动
+    teacher_accuracy = 0.0        # 教师模型的性能基准
+
     # 云轮次计数器
     cloud_round = 0
 
@@ -259,9 +269,26 @@ def main():
             for client_id in selected_client_ids:  # 只训练被选中的客户端
                 client = clients[client_id]
 
-                # 设置教师模型（用于KL蒸馏，从第2轮开始）
+                # 自适应蒸馏逻辑
+                use_distillation_this_round = False
                 if USE_DISTILLATION and round_idx > 0:
-                    client.set_teacher_model(cloud_server.model.state_dict())
+                    if DISTILL_START_THRESHOLD == 0:
+                        # 阈值为0：第2轮立即开始蒸馏
+                        use_distillation_this_round = True
+                    elif distillation_enabled:
+                        # 已经启动过蒸馏，继续使用
+                        use_distillation_this_round = True
+                    elif len(accuracy_history) > 0:
+                        # 检查当前学生模型是否达到阈值
+                        current_accuracy = accuracy_history[-1]
+                        if current_accuracy >= teacher_accuracy * DISTILL_START_THRESHOLD:
+                            distillation_enabled = True
+                            use_distillation_this_round = True
+                            print(f"\n🎓 蒸馏已启动！学生性能: {current_accuracy:.2f}% ≥ {DISTILL_START_THRESHOLD:.0%} × 教师性能: {teacher_accuracy:.2f}%")
+
+                    # 设置教师模型
+                    if use_distillation_this_round:
+                        client.set_teacher_model(cloud_server.model.state_dict())
 
                 # 训练
                 train_loss = client.train(
@@ -269,7 +296,7 @@ def main():
                     LR_DECAY, LR_DECAY_EPOCH,
                     use_dp=USE_DP, dp_config=dp_config,
                     use_maml=USE_MAML, beta=BETA,
-                    use_distillation=USE_DISTILLATION,
+                    use_distillation=use_distillation_this_round,
                     temperature=DISTILL_TEMPERATURE,
                     alpha=DISTILL_ALPHA,
                     beta_feat=DISTILL_BETA,
@@ -293,13 +320,6 @@ def main():
             edge_models[edge_server.edge_id] = edge_server.get_model_parameters()
             print(f"  边缘服务器 {edge_server.edge_id} 聚合完成")
 
-        # 步骤5: 每 NUM_EDGE_AGGREGATION 轮执行一次云聚合
-        if (round_idx + 1) % NUM_EDGE_AGGREGATION == 0:
-            # 云服务器聚合边缘服务器模型
-            cloud_server.aggregate_edge_models(edge_models)
-            print(f"\n云服务器聚合完成 (边缘聚合轮次: {(round_idx % NUM_EDGE_AGGREGATION) + 1}/{NUM_EDGE_AGGREGATION})")
-            cloud_round += 1
-
         # 步骤5: 云服务器聚合边缘服务器模型
         cloud_server.aggregate_edge_models(edge_models)
         print(f"\n云服务器聚合完成")
@@ -312,17 +332,23 @@ def main():
         accuracy_history.append(accuracy)
         loss_history.append(test_loss)
 
+        # 更新教师模型性能基准（用于自适应蒸馏）
+        teacher_accuracy = accuracy
+
         # TensorBoard: 记录全局指标
         if writer:
             writer.add_scalar('Global/Test_Accuracy', accuracy, round_idx)
             writer.add_scalar('Global/Test_Loss', test_loss, round_idx)
             writer.add_scalar('Global/Avg_Client_Train_Loss', avg_client_loss, round_idx)
             writer.add_scalar('Hyperparameters/Learning_Rate', LEARNING_RATE * (LR_DECAY ** round_idx), round_idx)
+            writer.add_scalar('Distillation/Enabled', int(distillation_enabled), round_idx)
 
         print(f"\n轮次 {round_idx + 1} 结果:")
         print(f"  测试准确率: {accuracy:.2f}%")
         print(f"  测试损失: {test_loss:.4f}")
         print(f"  平均客户端训练损失: {avg_client_loss:.4f}")
+        if USE_DISTILLATION and DISTILL_START_THRESHOLD > 0:
+            print(f"  蒸馏状态: {'✓ 已启动' if distillation_enabled else f'等待中 (需达到 {teacher_accuracy * DISTILL_START_THRESHOLD:.2f}%)'}")
 
         # 记录隐私消耗
         if privacy_accountant is not None:
@@ -350,6 +376,8 @@ def main():
     print(f"{'='*70}")
     print(f"最终测试准确率: {accuracy_history[-1]:.2f}%")
     print(f"最终测试损失: {loss_history[-1]:.4f}")
+    if USE_DISTILLATION and DISTILL_START_THRESHOLD > 0:
+        print(f"蒸馏最终状态: {'已启动' if distillation_enabled else '未达到启动条件'}")
 
     # 保存隐私统计历史
     if privacy_accountant is not None:
@@ -383,7 +411,7 @@ def main():
     plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    filename = f'training_results_{"with_dp" if USE_DP else "without_dp"}.png'
+    filename = f'training_results_adaptive_distillation.png'
     plt.savefig(filename, dpi=150)
     print(f"训练曲线已保存到 {filename} (实际训练 {actual_rounds}/{NUM_ROUNDS} 轮)")
 
