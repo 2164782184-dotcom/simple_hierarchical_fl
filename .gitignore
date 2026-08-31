@@ -28,6 +28,7 @@ ENV/
 
 # 数据集（太大不需要提交）
 data/
+runs/
 *.png
 *.jpg
 *.jpeg
