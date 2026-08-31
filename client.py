@@ -122,7 +122,8 @@ class Client:
     def train(self, epochs, learning_rate, momentum=0, weight_decay=0,
               lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None,
               use_maml=False, beta=0.001, use_distillation=False,
-              temperature=3.0, alpha=0.5, beta_feat=0.3, use_dp_distillation=False):
+              temperature=3.0, alpha=0.5, beta_feat=0.3, use_dp_distillation=False,
+              weight_adjuster=None):
         """
         在本地数据上训练模型（支持标准训练和MAML元学习）
 
@@ -153,7 +154,7 @@ class Client:
         if use_maml and self.support_loader and self.query_loader:
             return self._train_maml(epochs, learning_rate, beta,
                                    use_distillation, temperature, alpha, beta_feat,
-                                   use_dp_distillation, dp_config)
+                                   use_dp_distillation, dp_config, weight_adjuster)
         else:
             return self._train_standard(epochs, learning_rate, momentum,
                                        weight_decay, lr_decay, lr_decay_epoch)
@@ -198,8 +199,8 @@ class Client:
 
     def _train_maml(self, num_iter, inner_lr, outer_lr,
                    use_distillation, temperature, alpha, beta_feat,
-                   use_dp_distillation, dp_config):
-        """MAML元学习训练方法（支持三组件互蒸馏：CE + KL + MSE + 蒸馏差分隐私）"""
+                   use_dp_distillation, dp_config, weight_adjuster=None):
+        """MAML元学习训练方法（支持三组件互蒸馏：CE + KL + MSE + 蒸馏差分隐私 + 动态权重调整）"""
         self.model.train()
         criterion = nn.CrossEntropyLoss()
         mse_criterion = nn.MSELoss()
@@ -291,12 +292,21 @@ class Client:
                     # 特征MSE损失（使用fc2层特征，通常是最后一个隐藏层）
                     feat_loss = mse_criterion(student_features['fc2'], teacher_features['fc2'])
 
+                    # 动态调整权重（如果启用）
+                    if weight_adjuster is not None:
+                        alpha, beta_feat = weight_adjuster.update(
+                            ce_loss.item(), kl_loss.item(), feat_loss.item()
+                        )
+
                     # 三组件组合损失：loss = (1-α-β)*CE + α*KL + β*MSE
                     loss = (1 - alpha - beta_feat) * ce_loss + alpha * kl_loss + beta_feat * feat_loss
 
                     # 诊断：打印各损失分量（只在第一个batch打印，避免刷屏）
                     if query_num_samples == 0 and iteration == 0:
-                        print(f"[客户端{self.client_id}] CE: {ce_loss.item():.4f}, KL: {kl_loss.item():.4f}, MSE: {feat_loss.item():.4f}, Total: {loss.item():.4f}")
+                        if weight_adjuster is not None:
+                            print(f"[客户端{self.client_id}] CE: {ce_loss.item():.4f}, KL: {kl_loss.item():.4f}, MSE: {feat_loss.item():.4f}, α: {alpha:.3f}, β: {beta_feat:.3f}, Total: {loss.item():.4f}")
+                        else:
+                            print(f"[客户端{self.client_id}] CE: {ce_loss.item():.4f}, KL: {kl_loss.item():.4f}, MSE: {feat_loss.item():.4f}, Total: {loss.item():.4f}")
                 else:
                     loss = ce_loss
 

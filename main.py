@@ -13,6 +13,7 @@ from client import Client, DPConfig
 from edge_server import EdgeServer
 from cloud_server import CloudServer
 from privacy_accountant import PrivacyAccountant
+from dynamic_weights import DynamicWeightAdjuster
 
 
 def main():
@@ -54,10 +55,11 @@ def main():
     # ==================== 知识蒸馏配置 ====================
     USE_DISTILLATION = True               # 是否使用KL蒸馏
     DISTILL_TEMPERATURE = 3.0             # 蒸馏温度参数
-    DISTILL_ALPHA = 0.4                   # KL损失权重（软标签）
-    DISTILL_BETA = 0.2                    # MSE损失权重（特征层）
+    DISTILL_ALPHA = 0.4                   # KL损失权重（软标签）初始值
+    DISTILL_BETA = 0.2                    # MSE损失权重（特征层）初始值
     USE_DP_DISTILLATION = True            # 是否对蒸馏过程使用差分隐私（保护教师模型输出）
     DISTILL_START_THRESHOLD = 0.7         # 蒸馏启动阈值（学生达到教师70%性能时才开始，0=立即开始）
+    USE_DYNAMIC_WEIGHTS = True            # 是否动态调整KL和MSE权重（根据CE/KL/MSE损失大小自适应）
     # 总损失 = (1-α-β)*CE + α*KL + β*MSE
 
     # ==================== 隐私预算统计配置 ====================
@@ -231,6 +233,16 @@ def main():
     distillation_enabled = False  # 蒸馏是否已启动
     teacher_accuracy = 0.0        # 教师模型的性能基准
 
+    # 动态权重调整器（每个客户端一个）
+    weight_adjusters = {}
+    if USE_DYNAMIC_WEIGHTS and USE_DISTILLATION:
+        for client_id in range(NUM_CLIENTS):
+            weight_adjusters[client_id] = DynamicWeightAdjuster(
+                initial_alpha=DISTILL_ALPHA,
+                initial_beta=DISTILL_BETA
+            )
+        print(f"互蒸馏机制的动态权重调整已启用")
+
     # 云轮次计数器
     cloud_round = 0
 
@@ -303,7 +315,8 @@ def main():
                     temperature=DISTILL_TEMPERATURE,
                     alpha=DISTILL_ALPHA,
                     beta_feat=DISTILL_BETA,
-                    use_dp_distillation=USE_DP_DISTILLATION
+                    use_dp_distillation=USE_DP_DISTILLATION,
+                    weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
                 )
 
                 # 获取模型参数（如果使用DP，返回处理后的梯度）
