@@ -40,11 +40,23 @@ def main():
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
 
+    # ==================== MAML元学习配置 ====================
+    USE_MAML = True                       # 是否使用MAML元学习
+    SUPPORT_RATIO = 0.8                   # support集占比（0.8 = 80% support, 20% query）
+    BETA = 0.001                          # MAML外层学习率（Adam优化器）
+    TRAIN_INNER_STEP = 5                  # support集采样batch数（0=遍历全部，>0=采样指定数量batch）
+    TEST_INNER_STEP = 5                   # query集采样batch数（0=遍历全部，>0=采样指定数量batch）
+
+    # ==================== 知识蒸馏配置 ====================
+    USE_DISTILLATION = True               # 是否使用KL蒸馏
+    DISTILL_TEMPERATURE = 3.0             # 蒸馏温度参数
+    DISTILL_ALPHA = 0.4                   # KL损失权重（loss = (1-α)*CE + α*KL）
+
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
 
     print("="*70)
-    print("分层联邦学习 + 差分隐私 (Hierarchical FL with Differential Privacy)")
+    print("分层联邦学习 + 差分隐私 + MAML + KL蒸馏")
     print("="*70)
     print(f"设备: {DEVICE}")
     print(f"边缘服务器数量: {NUM_EDGES}")
@@ -54,6 +66,21 @@ def main():
     print(f"本地训练轮数: {LOCAL_EPOCHS}")
     print(f"客户端数据分布: {'IID' if CLIENT_IID else 'Non-IID'}")
     print(f"边缘服务器数据分布: {'IID' if EDGE_IID else 'Non-IID'}")
+    print(f"\n{'='*70}")
+    print(f"MAML元学习配置:")
+    print(f"  启用状态: {'是' if USE_MAML else '否'}")
+    if USE_MAML:
+        print(f"  Support/Query比例: {SUPPORT_RATIO:.0%}/{1-SUPPORT_RATIO:.0%}")
+        print(f"  内层学习率: {LEARNING_RATE}")
+        print(f"  外层学习率: {BETA}")
+        print(f"  Support采样batch数: {TRAIN_INNER_STEP if TRAIN_INNER_STEP > 0 else '全部'}")
+        print(f"  Query采样batch数: {TEST_INNER_STEP if TEST_INNER_STEP > 0 else '全部'}")
+    print(f"\n{'='*70}")
+    print(f"知识蒸馏配置:")
+    print(f"  启用状态: {'是' if USE_DISTILLATION else '否'}")
+    if USE_DISTILLATION:
+        print(f"  温度参数: {DISTILL_TEMPERATURE}")
+        print(f"  KL损失权重α: {DISTILL_ALPHA}")
     print(f"\n{'='*70}")
     print(f"差分隐私配置:")
     print(f"  启用状态: {'是' if USE_DP else '否'}")
@@ -87,7 +114,19 @@ def main():
     print("[2/6] 将数据分配给客户端...")
     client_data_indices = split_data_to_clients(train_dataset, NUM_CLIENTS, NUM_EDGES,
                                                  client_iid=CLIENT_IID, edge_iid=EDGE_IID)
-    client_loaders = create_data_loaders(train_dataset, client_data_indices, BATCH_SIZE)
+
+    # 根据是否使用MAML决定如何创建数据加载器
+    if USE_MAML:
+        print(f"      使用MAML模式，划分support/query集 ({SUPPORT_RATIO:.0%}/{1-SUPPORT_RATIO:.0%})")
+        client_support_loaders, client_query_loaders = create_data_loaders(
+            train_dataset, client_data_indices, BATCH_SIZE, support_ratio=SUPPORT_RATIO
+        )
+        client_loaders = None  # 标准模式不使用
+    else:
+        print("      使用标准训练模式")
+        client_loaders = create_data_loaders(train_dataset, client_data_indices, BATCH_SIZE)
+        client_support_loaders = None
+        client_query_loaders = None
 
     # ==================== 初始化差分隐私配置 ====================
     dp_config = None
@@ -117,7 +156,20 @@ def main():
     # 创建客户端
     clients = []
     for client_id in range(NUM_CLIENTS):
-        client = Client(client_id, client_loaders[client_id], device=DEVICE)
+        if USE_MAML:
+            # MAML模式：传入support和query加载器
+            client = Client(
+                client_id,
+                data_loader=None,  # 标准模式不使用
+                device=DEVICE,
+                support_loader=client_support_loaders[client_id],
+                query_loader=client_query_loaders[client_id],
+                train_inner_step=TRAIN_INNER_STEP,
+                test_inner_step=TEST_INNER_STEP
+            )
+        else:
+            # 标准模式
+            client = Client(client_id, client_loaders[client_id], device=DEVICE)
         clients.append(client)
 
         # 将客户端注册到对应的边缘服务器
@@ -153,9 +205,20 @@ def main():
             for client_id in edge_server.client_ids:
                 client = clients[client_id]
 
+                # 设置教师模型（用于KL蒸馏，从第2轮开始）
+                if USE_DISTILLATION and round_idx > 0:
+                    client.set_teacher_model(cloud_server.model.state_dict())
+
                 # 训练
-                train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY, LR_DECAY, LR_DECAY_EPOCH,
-                                         use_dp=USE_DP, dp_config=dp_config)
+                train_loss = client.train(
+                    LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                    LR_DECAY, LR_DECAY_EPOCH,
+                    use_dp=USE_DP, dp_config=dp_config,
+                    use_maml=USE_MAML, beta=BETA,
+                    use_distillation=USE_DISTILLATION,
+                    temperature=DISTILL_TEMPERATURE,
+                    alpha=DISTILL_ALPHA
+                )
 
                 # 获取模型参数（如果使用DP，返回处理后的梯度）
                 client_models[client_id] = client.get_model_parameters(

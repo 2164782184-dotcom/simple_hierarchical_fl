@@ -226,31 +226,69 @@ def split_data_to_clients(train_dataset, num_clients, num_edges, client_iid=True
     return client_data_indices
 
 
-def create_data_loaders(train_dataset, client_data_indices, batch_size):
+def create_data_loaders(train_dataset, client_data_indices, batch_size, support_ratio=1.0):
     """
-    为每个客户端创建DataLoader
+    为每个客户端创建DataLoader（支持support/query划分用于MAML元学习）
 
     Args:
         train_dataset: 完整的训练数据集
         client_data_indices: 客户端数据索引字典
         batch_size: 批次大小
+        support_ratio: support集占比（1.0表示不划分，使用完整数据；<1.0时划分为support和query）
 
     Returns:
-        client_loaders: 字典，key为客户端ID，value为DataLoader
+        如果support_ratio=1.0: 返回client_loaders字典
+        如果support_ratio<1.0: 返回(client_support_loaders, client_query_loaders)元组
     """
-    client_loaders = {}
+    if support_ratio >= 1.0:
+        # 不划分，返回完整数据加载器（保持原有行为）
+        client_loaders = {}
+        for client_id, indices in client_data_indices.items():
+            subset = torch.utils.data.Subset(train_dataset, indices)
+            loader = torch.utils.data.DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+            client_loaders[client_id] = loader
+        return client_loaders
+    else:
+        # 划分为support和query集（用于MAML）
+        client_support_loaders = {}
+        client_query_loaders = {}
 
-    for client_id, indices in client_data_indices.items():
-        subset = torch.utils.data.Subset(train_dataset, indices)
-        loader = torch.utils.data.DataLoader(
-            subset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0
-        )
-        client_loaders[client_id] = loader
+        for client_id, indices in client_data_indices.items():
+            # 随机打乱索引
+            indices = np.array(indices)
+            np.random.shuffle(indices)
 
-    return client_loaders
+            # 划分support和query
+            split_point = int(len(indices) * support_ratio)
+            support_indices = indices[:split_point].tolist()
+            query_indices = indices[split_point:].tolist()
+
+            # 创建support loader
+            support_subset = torch.utils.data.Subset(train_dataset, support_indices)
+            support_loader = torch.utils.data.DataLoader(
+                support_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+            client_support_loaders[client_id] = support_loader
+
+            # 创建query loader
+            query_subset = torch.utils.data.Subset(train_dataset, query_indices)
+            query_loader = torch.utils.data.DataLoader(
+                query_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0
+            )
+            client_query_loaders[client_id] = query_loader
+
+        return client_support_loaders, client_query_loaders
 
 
 def analyze_data_distribution(train_dataset, client_data_indices, num_edges, num_clients,description):
