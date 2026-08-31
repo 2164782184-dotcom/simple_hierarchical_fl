@@ -249,7 +249,7 @@ def create_data_loaders(train_dataset, client_data_indices, batch_size, support_
                 subset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=0,
                 pin_memory=True
             )
             client_loaders[client_id] = loader
@@ -275,7 +275,7 @@ def create_data_loaders(train_dataset, client_data_indices, batch_size, support_
                 support_subset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=0,
                 pin_memory=True
             )
             client_support_loaders[client_id] = support_loader
@@ -286,7 +286,7 @@ def create_data_loaders(train_dataset, client_data_indices, batch_size, support_
                 query_subset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=0,
                 pin_memory=True
             )
             client_query_loaders[client_id] = query_loader

@@ -22,13 +22,13 @@ def main():
     NUM_ROUNDS = 100                      # 全局训练轮数
     NUM_EDGE_AGGREGATION = 1              # 边缘聚合次数（每次云聚合前，边缘进行多少轮本地聚合）
     LOCAL_EPOCHS = 60                     # 客户端本地训练轮数
-    BATCH_SIZE = 20                       # 批次大小（GPU优化：可增加到64/128以提高GPU利用率）
+    BATCH_SIZE = 64                       # 批次大小（GPU优化：64适合中等数据集）
     LEARNING_RATE = 0.01                  # 初始学习率
     LR_DECAY = 0.995                      # 学习率衰减系数（gamma）
     LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
     MOMENTUM = 0                          # SGD动量（0表示不使用动量）
     WEIGHT_DECAY = 0                      # 权重衰减/L2正则化（0表示不使用）
-    TRAIN_FRACTION = 0.01                 # 训练集的使用比例（0.01=使用1%数据）
+    TRAIN_FRACTION = 0.5                  # 训练集的使用比例（0.5=使用50%数据，增加以提高GPU利用率）
     CLIENT_IID = False                    # 客户端数据是否IID分布
     EDGE_IID = True                       # 边缘服务器数据是否IID分布
     FRAC = 1.0                            # 每轮参与训练的客户端比例（1.0=全部参与）
