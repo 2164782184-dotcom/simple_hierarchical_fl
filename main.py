@@ -22,7 +22,7 @@ def main():
     NUM_ROUNDS = 100                      # 全局训练轮数
     NUM_EDGE_AGGREGATION = 1              # 边缘聚合次数（每次云聚合前，边缘进行多少轮本地聚合）
     LOCAL_EPOCHS = 60                     # 客户端本地训练轮数
-    BATCH_SIZE = 20                       # 批次大小
+    BATCH_SIZE = 20                       # 批次大小（GPU优化：可增加到64/128以提高GPU利用率）
     LEARNING_RATE = 0.01                  # 初始学习率
     LR_DECAY = 0.995                      # 学习率衰减系数（gamma）
     LR_DECAY_EPOCH = 1                    # 每1个epoch执行一次学习率衰减
@@ -77,6 +77,10 @@ def main():
     print("分层联邦学习 + 差分隐私 + MAML + KL蒸馏")
     print("="*70)
     print(f"设备: {DEVICE}")
+    if torch.cuda.is_available():
+        print(f"GPU设备名称: {torch.cuda.get_device_name(0)}")
+        print(f"可用GPU数量: {torch.cuda.device_count()}")
+        print(f"当前GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     print(f"边缘服务器数量: {NUM_EDGES}")
     print(f"每个边缘服务器的客户端数量: {NUM_CLIENTS_PER_EDGE}")
     print(f"总客户端数量: {NUM_CLIENTS}")

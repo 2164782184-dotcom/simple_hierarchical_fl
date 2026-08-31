@@ -78,6 +78,12 @@ class Client:
     def set_model(self, global_model):
         """接收来自边缘服务器的全局模型"""
         self.model = copy.deepcopy(global_model)
+
+        # 多GPU支持
+        if torch.cuda.device_count() > 1 and self.device.type == 'cuda':
+            print(f"客户端 {self.client_id} 使用 {torch.cuda.device_count()} 个GPU进行训练")
+            self.model = nn.DataParallel(self.model)
+
         self.model.to(self.device)
         # 保存初始参数
         self.initial_params = copy.deepcopy(self.model.state_dict())
