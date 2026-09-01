@@ -290,7 +290,10 @@ class Client:
                     kl_loss = self._compute_kl_loss(student_output, teacher_output, temperature)
 
                     # 特征MSE损失（使用fc2层特征，通常是最后一个隐藏层）
-                    feat_loss = mse_criterion(student_features['fc2'], teacher_features['fc2'])
+                    # 归一化特征以避免数值尺度差异过大
+                    student_feat_normalized = F.normalize(student_features['fc2'], p=2, dim=1)
+                    teacher_feat_normalized = F.normalize(teacher_features['fc2'], p=2, dim=1)
+                    feat_loss = mse_criterion(student_feat_normalized, teacher_feat_normalized)
 
                     # 动态调整权重（如果启用）
                     if weight_adjuster is not None:
