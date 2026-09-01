@@ -77,9 +77,9 @@ class DynamicWeightAdjuster:
         kl_ratio = avg_kl / total_loss
         mse_ratio = avg_mse / total_loss
 
-        # 策略：损失大的部分增加权重
-        # 保留40%给CE（硬标签很重要），剩下60%在KL和MSE之间分配
-        available_weight = 0.6  # alpha + beta 的最大和
+        # 保留给CE至少20%的权重，至多50%
+        ce_weight = max(0.2, min(0.5, ce_ratio))
+        available_weight = 1 - ce_weight
 
         # 根据KL和MSE的比例分配权重
         kl_mse_total = kl_ratio + mse_ratio
