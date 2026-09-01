@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 from datetime import datetime
+import copy
 
 plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti SC', 'Hiragino Sans GB', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
@@ -230,9 +231,9 @@ def main():
     loss_history = []
 
     # 自适应蒸馏相关变量
-    distillation_enabled = False      # 蒸馏是否已启动
-    best_accuracy = 0.0               # 历史最佳准确率（作为教师基准）
-    rounds_since_improvement = 0      # 自上次提升以来的轮数
+    distillation_enabled = False      # 学生是否达标（可以让教师开始蒸馏学生）
+    teacher_accuracy = 0.0            # 教师模型的准确率
+    student_accuracy = 0.0            # 学生模型的准确率
 
     # 动态权重调整器（每个客户端一个）
     weight_adjusters = {}
@@ -280,61 +281,105 @@ def main():
             if FRAC < 1.0:
                 print(f"  客户端采样: {num_selected}/{len(all_client_ids)} 个客户端参与训练")
 
-            # 步骤3: 客户端本地训练
+            # 步骤3: 客户端本地训练（双向互蒸馏）
             client_models = {}
-            for client_id in selected_client_ids:  # 只训练被选中的客户端
+            teacher_losses = []
+            student_losses = []
+
+            for client_id in selected_client_ids:
                 client = clients[client_id]
 
-                # 自适应蒸馏逻辑
-                use_distillation_this_round = False
-                if USE_DISTILLATION and round_idx > 0:
-                    if DISTILL_START_THRESHOLD == 0:
-                        # 阈值为0：第2轮立即开始蒸馏
-                        use_distillation_this_round = True
-                    elif distillation_enabled:
-                        # 已经启动过蒸馏，继续使用
-                        use_distillation_this_round = True
-                    elif len(accuracy_history) >= 2:
-                        # 检查模型是否在稳定提升（连续两轮准确率都在增长）
-                        # 说明模型已经有一定质量，可以作为教师
-                        prev_acc = accuracy_history[-2]
-                        curr_acc = accuracy_history[-1]
-
-                        # 如果当前准确率达到历史最佳的阈值比例，启动蒸馏
-                        if curr_acc >= best_accuracy * DISTILL_START_THRESHOLD and curr_acc > prev_acc:
-                            distillation_enabled = True
-                            use_distillation_this_round = True
-                            print(f"\n🎓 蒸馏已启动！当前性能: {curr_acc:.2f}% ≥ {DISTILL_START_THRESHOLD:.0%} × 历史最佳: {best_accuracy:.2f}%")
-
-                    # 设置教师模型
-                    if use_distillation_this_round:
-                        client.set_teacher_model(cloud_server.model.state_dict())
-
-                # 训练
-                train_loss = client.train(
+                # ========== 阶段1: 教师训练 ==========
+                # 教师总是只用CE训练（不蒸馏学生）
+                teacher_train_loss = client.train(
                     LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
                     LR_DECAY, LR_DECAY_EPOCH,
                     use_dp=USE_DP, dp_config=dp_config,
                     use_maml=USE_MAML, beta=BETA,
-                    use_distillation=use_distillation_this_round,
+                    use_distillation=False,  # 教师第一阶段只用CE
+                    temperature=DISTILL_TEMPERATURE,
+                    alpha=DISTILL_ALPHA,
+                    beta_feat=DISTILL_BETA,
+                    use_dp_distillation=USE_DP_DISTILLATION,
+                    weight_adjuster=None
+                )
+                teacher_losses.append(teacher_train_loss)
+
+                # 保存教师模型参数
+                # 1. 带DP的版本用于传递给学生（隐私保护）
+                teacher_params_with_dp = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
+
+                # 2. 不带DP的state_dict用于本地蒸馏目标（仅当不使用DP时）
+                if not USE_DP:
+                    teacher_state_dict = teacher_params_with_dp  # 不使用DP时，两者相同
+                else:
+                    # 使用DP时，保存当前模型的state_dict用于后续互蒸馏
+                    teacher_state_dict = copy.deepcopy(client.model.state_dict())
+
+                # ========== 阶段2: 学生蒸馏教师（使用CE+KL+MSE） ==========
+                # 将教师参数加载为学生的蒸馏目标
+                # 注意：这里需要先恢复教师的带DP参数到模型，再设为蒸馏目标
+                if USE_DP:
+                    # 使用DP时，需要从带DP的梯度重建参数
+                    # 但set_teacher_model需要state_dict，所以我们直接用teacher_state_dict
+                    client.set_teacher_model(teacher_state_dict)
+                else:
+                    client.set_teacher_model(teacher_params_with_dp)
+
+                # 学生训练（蒸馏教师）
+                student_train_loss = client.train(
+                    LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                    LR_DECAY, LR_DECAY_EPOCH,
+                    use_dp=USE_DP, dp_config=dp_config,
+                    use_maml=USE_MAML, beta=BETA,
+                    use_distillation=USE_DISTILLATION,  # 学生总是蒸馏教师
                     temperature=DISTILL_TEMPERATURE,
                     alpha=DISTILL_ALPHA,
                     beta_feat=DISTILL_BETA,
                     use_dp_distillation=USE_DP_DISTILLATION,
                     weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
                 )
+                student_losses.append(student_train_loss)
 
-                # 获取模型参数（如果使用DP，返回处理后的梯度）
-                client_models[client_id] = client.get_model_parameters(
-                    use_dp=USE_DP, dp_config=dp_config
-                )
+                # 获取学生模型参数（用于上传，可能带DP）
+                student_params_for_upload = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
 
-                print(f"  客户端 {client_id} 训练完成, 损失: {train_loss:.4f}")
-                round_client_losses.append(train_loss)
+                # 保存学生模型的state_dict（不加DP，用于蒸馏目标）
+                student_state_dict = copy.deepcopy(client.model.state_dict())
+
+                # ========== 阶段3: 如果互蒸馏已启动，教师蒸馏学生 ==========
+                if distillation_enabled:
+                    # 互蒸馏已启动：教师再次训练，这次蒸馏学生
+                    # 将学生参数设为教师的蒸馏目标
+                    client.model.load_state_dict(teacher_state_dict)  # 恢复教师参数
+                    client.set_teacher_model(student_state_dict)  # 学生作为教师的蒸馏目标
+
+                    mutual_teacher_loss = client.train(
+                        LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                        LR_DECAY, LR_DECAY_EPOCH,
+                        use_dp=USE_DP, dp_config=dp_config,
+                        use_maml=USE_MAML, beta=BETA,
+                        use_distillation=True,  # 教师蒸馏学生
+                        temperature=DISTILL_TEMPERATURE,
+                        alpha=DISTILL_ALPHA,
+                        beta_feat=DISTILL_BETA,
+                        use_dp_distillation=USE_DP_DISTILLATION,
+                        weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
+                    )
+
+                    # 注意：无论教师是否蒸馏学生，上传的始终是学生参数
+                    client_models[client_id] = student_params_for_upload
+                    print(f"  客户端 {client_id} 训练完成 [互蒸馏] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}, 互蒸馏教师损失: {mutual_teacher_loss:.4f}")
+                else:
+                    # 未达标，只上传学生参数
+                    client_models[client_id] = student_params_for_upload
+                    print(f"  客户端 {client_id} 训练完成 [单向S→T] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}")
+
+                round_client_losses.append(student_train_loss)  # 记录学生损失
 
                 # TensorBoard: 记录每个客户端的训练损失
                 if writer:
-                    writer.add_scalar(f'Client/Loss_Client_{client_id}', train_loss, round_idx)
+                    writer.add_scalar(f'Client/Loss_Client_{client_id}', student_train_loss, round_idx)
 
             # 步骤4: 边缘服务器聚合客户端模型
             edge_server.aggregate_client_models(client_models, use_dp=USE_DP)
@@ -353,12 +398,22 @@ def main():
         accuracy_history.append(accuracy)
         loss_history.append(test_loss)
 
-        # 更新历史最佳准确率（用于自适应蒸馏）
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            rounds_since_improvement = 0
+        # 评估教师模型和学生模型的性能
+        # 注意：这里的accuracy是学生模型的准确率（最终上传的模型）
+        student_accuracy = accuracy
+
+        # 教师模型的准确率（第一轮后记录）
+        if round_idx == 0:
+            teacher_accuracy = accuracy  # 第一轮作为基准
         else:
-            rounds_since_improvement += 1
+            # 检查学生是否达到教师的70%
+            if not distillation_enabled and DISTILL_START_THRESHOLD > 0:
+                if student_accuracy >= teacher_accuracy * DISTILL_START_THRESHOLD:
+                    distillation_enabled = True
+                    print(f"\n🎓 互蒸馏已启动！学生准确率 {student_accuracy:.2f}% ≥ {DISTILL_START_THRESHOLD:.0%} × 教师准确率 {teacher_accuracy:.2f}%")
+
+            # 更新教师准确率为当前学生准确率（学生成为下一轮的教师）
+            teacher_accuracy = student_accuracy
 
         # TensorBoard: 记录全局指标
         if writer:
@@ -373,8 +428,11 @@ def main():
         print(f"  测试损失: {test_loss:.4f}")
         print(f"  平均客户端训练损失: {avg_client_loss:.4f}")
         if USE_DISTILLATION and DISTILL_START_THRESHOLD > 0:
-            status = '✓ 已启动' if distillation_enabled else f'等待中 (当前: {accuracy:.2f}%, 需达到: {best_accuracy * DISTILL_START_THRESHOLD:.2f}%)'
-            print(f"  蒸馏状态: {status}")
+            if distillation_enabled:
+                print(f"  互蒸馏状态: ✓ 已启动（教师和学生互相蒸馏）")
+            else:
+                target = teacher_accuracy * DISTILL_START_THRESHOLD
+                print(f"  互蒸馏状态: 等待中 (当前: {student_accuracy:.2f}%, 需达到: {target:.2f}%)")
 
         # 记录隐私消耗
         if privacy_accountant is not None:
