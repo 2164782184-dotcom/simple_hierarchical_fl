@@ -15,6 +15,7 @@ from edge_server import EdgeServer
 from cloud_server import CloudServer
 from privacy_accountant import PrivacyAccountant
 from dynamic_weights import DynamicWeightAdjuster
+from parallel_trainer import ParallelTrainer, print_gpu_info
 
 
 def main():
@@ -59,6 +60,13 @@ def main():
     # ==================== 隐私预算统计配置 ====================
     USE_PRIVACY_ACCOUNTANT = False        # 是否启用隐私预算统计（关闭以避免超标警告）
 
+    # ==================== 多GPU并行训练配置 ====================
+    USE_MULTI_GPU = True                  # 是否启用多GPU并行训练
+    PARALLEL_MODE = 'auto'                # 'sequential'(方案1), 'parallel'(方案2), 'auto'(自动)
+    # 方案1: 多进程，每GPU串行训练客户端（稳定，适合显存<16GB）
+    # 方案2: 多进程+GPU内并行（最快，适合显存>=16GB）
+    # auto: 根据GPU显存自动选择
+
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = False                # 是否启用TensorBoard实时可视化
 
@@ -77,10 +85,16 @@ def main():
     print("="*70)
     print("分层联邦学习 + 差分隐私 + 教师-学生互蒸馏")
     print("="*70)
-    print(f"设备: {DEVICE}")
-    if torch.cuda.is_available():
-        print(f"GPU设备名称: {torch.cuda.get_device_name(0)}")
-        print(f"可用GPU数量: {torch.cuda.device_count()}")
+
+    # 打印GPU信息
+    if USE_MULTI_GPU and torch.cuda.is_available():
+        print_gpu_info()
+    else:
+        print(f"设备: {DEVICE}")
+        if torch.cuda.is_available():
+            print(f"GPU设备名称: {torch.cuda.get_device_name(0)}")
+            print(f"单GPU模式")
+        print()
         print(f"当前GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     print(f"边缘服务器数量: {NUM_EDGES}")
     print(f"每个边缘服务器的客户端数量: {NUM_CLIENTS_PER_EDGE}")
@@ -186,6 +200,15 @@ def main():
         edge_id = client_id // NUM_CLIENTS_PER_EDGE
         edge_servers[edge_id].register_client(client)
 
+    # ==================== 初始化并行训练器 ====================
+    parallel_trainer = None
+    if USE_MULTI_GPU and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        parallel_trainer = ParallelTrainer(mode=PARALLEL_MODE)
+        print(f"多GPU并行训练已启用\n")
+    else:
+        if USE_MULTI_GPU and torch.cuda.device_count() <= 1:
+            print(f"检测到单GPU，使用标准训练模式\n")
+
     # ==================== 开始训练 ====================
     print("[4/6] 开始分层联邦学习训练...\n")
 
@@ -249,7 +272,61 @@ def main():
             teacher_losses = []
             student_losses = []
 
-            for client_id in selected_client_ids:
+            # 使用多GPU并行训练或标准串行训练
+            if parallel_trainer is not None:
+                # 多GPU并行训练
+                training_params = {
+                    'LOCAL_EPOCHS': LOCAL_EPOCHS,
+                    'LEARNING_RATE': LEARNING_RATE,
+                    'MOMENTUM': MOMENTUM,
+                    'WEIGHT_DECAY': WEIGHT_DECAY,
+                    'LR_DECAY': LR_DECAY,
+                    'LR_DECAY_EPOCH': LR_DECAY_EPOCH,
+                    'USE_DP': USE_DP,
+                    'USE_DISTILLATION': USE_DISTILLATION,
+                    'DISTILL_TEMPERATURE': DISTILL_TEMPERATURE,
+                    'DISTILL_ALPHA': DISTILL_ALPHA,
+                    'DISTILL_BETA': DISTILL_BETA,
+                    'USE_DP_DISTILLATION': USE_DP_DISTILLATION,
+                }
+
+                # 获取全局模型状态
+                global_model_state = edge_server.global_model.state_dict()
+
+                # 并行训练所有客户端
+                all_results = parallel_trainer.train_clients(
+                    selected_client_ids=selected_client_ids,
+                    clients=clients,
+                    global_model_state=global_model_state,
+                    dp_config=dp_config,
+                    distillation_enabled=distillation_enabled,
+                    training_params=training_params
+                )
+
+                # 收集结果
+                for client_id in selected_client_ids:
+                    if client_id in all_results:
+                        result = all_results[client_id]
+                        client_models[client_id] = result['params']
+                        teacher_losses.append(result['teacher_loss'])
+                        student_losses.append(result['student_loss'])
+                        round_client_losses.append(result['student_loss'])
+
+                        # 打印结果
+                        if result['mutual_teacher_loss'] is not None:
+                            print(f"  客户端 {client_id} 训练完成 [互蒸馏] - 教师损失: {result['teacher_loss']:.4f}, "
+                                  f"学生损失: {result['student_loss']:.4f}, 互蒸馏教师损失: {result['mutual_teacher_loss']:.4f}")
+                        else:
+                            print(f"  客户端 {client_id} 训练完成 [单向S→T] - 教师损失: {result['teacher_loss']:.4f}, "
+                                  f"学生损失: {result['student_loss']:.4f}")
+
+                        # TensorBoard: 记录每个客户端的训练损失
+                        if writer:
+                            writer.add_scalar(f'Client/Loss_Client_{client_id}', result['student_loss'], round_idx)
+
+            else:
+                # 标准串行训练（原有代码）
+                for client_id in selected_client_ids:
                 client = clients[client_id]
 
                 # ========== 阶段1: 教师训练 ==========
