@@ -6,74 +6,24 @@ import numpy as np
 from privacy import Flatten_gradients, local_process, reshape_gradients
 
 
-class Adam:
-    """
-    全局Adam优化器（用于MAML外层更新）
-    """
-    def __init__(self, lr=0.01, betas=(0.9, 0.999), eps=1e-08):
-        self.lr = lr
-        self.beta1 = betas[0]
-        self.beta2 = betas[1]
-        self.eps = eps
-        self.m = dict()
-        self.v = dict()
-        self.n = 0
-
-    def __call__(self, params, grads, i):
-        if i not in self.m:
-            self.m[i] = torch.zeros_like(params)
-        if i not in self.v:
-            self.v[i] = torch.zeros_like(params)
-
-        self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * grads
-        self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * torch.square(grads)
-
-        alpha = self.lr * np.sqrt(1 - np.power(self.beta2, self.n))
-        alpha = alpha / (1 - np.power(self.beta1, self.n))
-
-        params.sub_(alpha * self.m[i] / (torch.sqrt(self.v[i]) + self.eps))
-
-    def increase_n(self):
-        self.n += 1
-
-
 class Client:
-    """客户端类（支持差分隐私 + MAML元学习 + KL蒸馏）"""
+    """客户端类（支持差分隐私 + 知识蒸馏）"""
 
-    def __init__(self, client_id, data_loader, device='cpu',
-                 support_loader=None, query_loader=None,
-                 train_inner_step=0, test_inner_step=0):
+    def __init__(self, client_id, data_loader, device='cpu'):
         """
         初始化客户端
 
         Args:
             client_id: 客户端ID
-            data_loader: 该客户端的数据加载器（标准模式）
+            data_loader: 该客户端的数据加载器
             device: 计算设备
-            support_loader: support集加载器（MAML模式）
-            query_loader: query集加载器（MAML模式）
-            train_inner_step: support集采样batch数（0=遍历全部）
-            test_inner_step: query集采样batch数（0=遍历全部）
         """
         self.client_id = client_id
         self.data_loader = data_loader
         self.device = device
         self.model = None
         self.initial_params = None  # 保存初始参数用于计算梯度
-
-        # MAML相关
-        self.support_loader = support_loader
-        self.query_loader = query_loader
-        self.teacher_model = None  # 教师模型（用于KL蒸馏）
-        self.train_inner_step = train_inner_step
-        self.test_inner_step = test_inner_step
-        self.outer_opt = None  # Adam优化器（外层更新）
-
-        # 初始化mini-batch迭代器
-        if self.support_loader and self.is_train_mini_batch:
-            self.train_dataset_loader_iterator = iter(self.support_loader)
-        if self.query_loader and self.is_test_mini_batch:
-            self.test_dataset_loader_iterator = iter(self.query_loader)
+        self.teacher_model = None  # 教师模型（用于知识蒸馏）
 
     def set_model(self, global_model):
         """接收来自边缘服务器的全局模型"""
@@ -83,7 +33,7 @@ class Client:
         self.initial_params = copy.deepcopy(self.model.state_dict())
 
     def set_teacher_model(self, teacher_model_state):
-        """设置教师模型（用于KL蒸馏）"""
+        """设置教师模型（用于知识蒸馏）"""
         if self.teacher_model is None:
             from models import get_model
             self.teacher_model = get_model()
@@ -91,58 +41,28 @@ class Client:
         self.teacher_model.to(self.device)
         self.teacher_model.eval()
 
-    @property
-    def is_train_mini_batch(self):
-        return self.train_inner_step > 0
-
-    @property
-    def is_test_mini_batch(self):
-        return self.test_inner_step > 0
-
-    def gen_support_batches(self):
-        """生成support集的mini-batch"""
-        for i in range(self.train_inner_step):
-            try:
-                data, target = next(self.train_dataset_loader_iterator)
-            except StopIteration:
-                self.train_dataset_loader_iterator = iter(self.support_loader)
-                data, target = next(self.train_dataset_loader_iterator)
-            yield data, target
-
-    def gen_query_batches(self):
-        """生成query集的mini-batch"""
-        for i in range(self.test_inner_step):
-            try:
-                data, target = next(self.test_dataset_loader_iterator)
-            except StopIteration:
-                self.test_dataset_loader_iterator = iter(self.query_loader)
-                data, target = next(self.test_dataset_loader_iterator)
-            yield data, target
-
     def train(self, epochs, learning_rate, momentum=0, weight_decay=0,
               lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None,
-              use_maml=False, beta=0.001, use_distillation=False,
-              temperature=3.0, alpha=0.5, beta_feat=0.3, use_dp_distillation=False,
-              weight_adjuster=None):
+              use_distillation=False, temperature=3.0, alpha=0.5, beta_feat=0.3,
+              use_dp_distillation=False, weight_adjuster=None):
         """
-        在本地数据上训练模型（支持标准训练和MAML元学习）
+        在本地数据上训练模型（标准训练+知识蒸馏）
 
         Args:
             epochs: 本地训练轮数
-            learning_rate: 初始学习率（标准模式或MAML内层学习率）
+            learning_rate: 学习率
             momentum: SGD动量参数（0表示不使用动量）
             weight_decay: 权重衰减/L2正则化系数（0表示不使用）
             lr_decay: 学习率衰减系数
             lr_decay_epoch: 每多少轮衰减一次学习率
             use_dp: 是否使用差分隐私（用于梯度上传）
             dp_config: 差分隐私配置参数
-            use_maml: 是否使用MAML元学习
-            beta: MAML外层学习率
-            use_distillation: 是否使用KL蒸馏
-            temperature: KL蒸馏温度参数
+            use_distillation: 是否使用知识蒸馏
+            temperature: 蒸馏温度参数
             alpha: KL蒸馏损失权重
             beta_feat: 特征蒸馏损失权重（MSE）
             use_dp_distillation: 是否对蒸馏过程使用差分隐私
+            weight_adjuster: 动态权重调整器
 
         Returns:
             avg_loss: 平均训练损失
@@ -150,20 +70,19 @@ class Client:
         if self.model is None:
             raise ValueError("Model not set. Call set_model() first.")
 
-        # 根据是否使用MAML选择训练方法
-        if use_maml and self.support_loader and self.query_loader:
-            return self._train_maml(epochs, learning_rate, beta,
+        return self._train_standard(epochs, learning_rate, momentum,
+                                   weight_decay, lr_decay, lr_decay_epoch,
                                    use_distillation, temperature, alpha, beta_feat,
                                    use_dp_distillation, dp_config, weight_adjuster)
-        else:
-            return self._train_standard(epochs, learning_rate, momentum,
-                                       weight_decay, lr_decay, lr_decay_epoch)
 
     def _train_standard(self, epochs, learning_rate, momentum,
-                       weight_decay, lr_decay, lr_decay_epoch):
-        """标准训练方法（保持原有逻辑不变）"""
+                       weight_decay, lr_decay, lr_decay_epoch,
+                       use_distillation=False, temperature=3.0, alpha=0.5, beta_feat=0.3,
+                       use_dp_distillation=False, dp_config=None, weight_adjuster=None):
+        """标准训练方法（支持知识蒸馏）"""
         self.model.train()
         criterion = nn.CrossEntropyLoss()
+        mse_criterion = nn.MSELoss()
         optimizer = torch.optim.SGD(self.model.parameters(),
                                      lr=learning_rate,
                                      momentum=momentum,
@@ -182,90 +101,8 @@ class Client:
                 data, target = data.to(self.device), target.to(self.device)
 
                 optimizer.zero_grad()
-                output = self.model(data)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
 
-                epoch_loss += loss.item()
-
-            # 每个epoch后更新学习率
-            scheduler.step()
-
-            total_loss += epoch_loss / len(self.data_loader)
-
-        avg_loss = total_loss / epochs
-        return avg_loss
-
-    def _train_maml(self, num_iter, inner_lr, outer_lr,
-                   use_distillation, temperature, alpha, beta_feat,
-                   use_dp_distillation, dp_config, weight_adjuster=None):
-        """MAML元学习训练方法（支持三组件互蒸馏：CE + KL + MSE + 蒸馏差分隐私 + 动态权重调整）"""
-        self.model.train()
-        criterion = nn.CrossEntropyLoss()
-        mse_criterion = nn.MSELoss()
-
-        # 初始化外层Adam优化器
-        if self.outer_opt is None:
-            self.outer_opt = Adam(lr=outer_lr)
-
-        total_loss = 0.0
-
-        for iteration in range(num_iter):
-            # 确定数据加载器
-            if self.is_train_mini_batch:
-                support_data_loader = self.gen_support_batches()
-            else:
-                support_data_loader = self.support_loader
-
-            if self.is_test_mini_batch:
-                query_data_loader = self.gen_query_batches()
-            else:
-                query_data_loader = self.query_loader
-
-            # 保存当前模型参数
-            temp_model = copy.deepcopy(self.model.state_dict())
-
-            # === 内层更新：在support集上快速适应 ===
-            loss_sum = 0.0
-            support_num_samples = 0
-
-            for data, target in support_data_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                num_sample = target.size(0)
-
-                output = self.model(data)
-                loss = criterion(output, target)
-
-                support_num_samples += num_sample
-                loss_sum += loss * num_sample
-
-            # 计算support集梯度
-            grads = torch.autograd.grad(
-                loss_sum / support_num_samples,
-                list(self.model.parameters()),
-                create_graph=True,
-                retain_graph=True
-            )
-
-            # 内层更新
-            for p, g in zip(self.model.parameters(), grads):
-                p.data.add_(g.data, alpha=-inner_lr)
-
-            # 清空梯度
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
-
-            # === 外层更新：在query集上元学习 + 三组件互蒸馏 ===
-            query_loss_sum = 0.0
-            query_num_samples = 0
-
-            for data, target in query_data_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                num_sample = target.size(0)
-
-                # 学生模型前向传播（获取logits和特征）
+                # 学生模型前向传播
                 if use_distillation and self.teacher_model is not None:
                     student_output, student_features = self.model(data, return_features=True)
                 else:
@@ -289,11 +126,15 @@ class Client:
                     # KL散度损失（软标签）
                     kl_loss = self._compute_kl_loss(student_output, teacher_output, temperature)
 
-                    # 特征MSE损失（使用fc2层特征，通常是最后一个隐藏层）
-                    # 归一化特征以避免数值尺度差异过大
-                    student_feat_normalized = F.normalize(student_features['fc2'], p=2, dim=1)
-                    teacher_feat_normalized = F.normalize(teacher_features['fc2'], p=2, dim=1)
-                    feat_loss = mse_criterion(student_feat_normalized, teacher_feat_normalized)
+                    # 特征MSE损失（使用fc2层特征）
+                    # 使用标准化而非归一化，保留幅度信息但统一尺度
+                    teacher_feat_mean = teacher_features['fc2'].mean()
+                    teacher_feat_std = teacher_features['fc2'].std() + 1e-8
+
+                    student_feat_scaled = (student_features['fc2'] - student_features['fc2'].mean()) / (student_features['fc2'].std() + 1e-8)
+                    teacher_feat_scaled = (teacher_features['fc2'] - teacher_feat_mean) / teacher_feat_std
+
+                    feat_loss = mse_criterion(student_feat_scaled, teacher_feat_scaled)
 
                     # 动态调整权重（如果启用）
                     if weight_adjuster is not None:
@@ -304,8 +145,8 @@ class Client:
                     # 三组件组合损失：loss = (1-α-β)*CE + α*KL + β*MSE
                     loss = (1 - alpha - beta_feat) * ce_loss + alpha * kl_loss + beta_feat * feat_loss
 
-                    # 诊断：打印各损失分量（只在第一个batch打印，避免刷屏）
-                    if query_num_samples == 0 and iteration == 0:
+                    # 诊断：打印各损失分量（只在第一个batch打印）
+                    if batch_idx == 0 and epoch == 0:
                         if weight_adjuster is not None:
                             print(f"[客户端{self.client_id}] CE: {ce_loss.item():.4f}, KL: {kl_loss.item():.4f}, MSE: {feat_loss.item():.4f}, α: {alpha:.3f}, β: {beta_feat:.3f}, Total: {loss.item():.4f}")
                         else:
@@ -313,31 +154,17 @@ class Client:
                 else:
                     loss = ce_loss
 
-                query_num_samples += num_sample
-                query_loss_sum += loss * num_sample
+                loss.backward()
+                optimizer.step()
 
-            # 计算query集梯度
-            grads = torch.autograd.grad(
-                query_loss_sum / query_num_samples,
-                list(self.model.parameters())
-            )
+                epoch_loss += loss.item()
 
-            # 使用Adam外层更新
-            self.outer_opt.increase_n()
-            for i, (key, value) in enumerate(temp_model.items()):
-                self.outer_opt(value, grads[i], i=i)
+            # 每个epoch后更新学习率
+            scheduler.step()
 
-            # 加载更新后的参数
-            self.model.load_state_dict(temp_model)
+            total_loss += epoch_loss / len(self.data_loader)
 
-            # 清空梯度
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
-
-            total_loss += query_loss_sum.item()
-
-        avg_loss = total_loss / (num_iter * query_num_samples) if query_num_samples > 0 else 0
+        avg_loss = total_loss / epochs
         return avg_loss
 
     def _compute_kl_loss(self, student_logits, teacher_logits, temperature):
