@@ -49,6 +49,63 @@ def load_mnist(data_dir='./data', train_fraction=1.0):
     return train_dataset, test_dataset
 
 
+def load_cifar10(data_dir='./data', train_fraction=1.0):
+    """
+    加载CIFAR-10数据集
+
+    Args:
+        data_dir: 数据存储目录
+        train_fraction: 训练集使用比例（1.0=使用100%数据）
+
+    Returns:
+        train_dataset: 训练数据集
+        test_dataset: 测试数据集
+    """
+    def stratified_split(dataset, fraction, seed=42):
+        """分层采样，保持各类别比例不变"""
+        # 按标签分组
+        label_to_indices = {}
+        for idx, (_, label) in enumerate(dataset):
+            if label not in label_to_indices:
+                label_to_indices[label] = []
+            label_to_indices[label].append(idx)
+
+        # 每个类别按比例采样
+        selected_indices = []
+        generator = torch.Generator().manual_seed(seed)
+
+        for label, indices in label_to_indices.items():
+            num_samples = int(len(indices) * fraction)
+            # 随机打乱后取前 num_samples 个
+            perm = torch.randperm(len(indices), generator=generator)
+            selected_indices.extend([indices[i] for i in perm[:num_samples]])
+
+        return SubsetWithClasses(dataset, selected_indices)
+
+    # CIFAR-10的数据增强和标准化
+    # 训练集使用数据增强
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    # 测试集只做标准化
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    train_dataset = datasets.CIFAR10(data_dir, train=True, download=True, transform=transform_train)
+    test_dataset = datasets.CIFAR10(data_dir, train=False, download=True, transform=transform_test)
+
+    if train_fraction < 1.0:
+        train_dataset = stratified_split(train_dataset, train_fraction)
+
+    return train_dataset, test_dataset
+
+
 def split_data_to_clients(train_dataset, num_clients, num_edges, client_iid=True, edge_iid=True):
     """
     将训练数据分配给客户端，支持分别控制客户端和边缘服务器的数据分布

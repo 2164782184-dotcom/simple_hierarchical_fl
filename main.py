@@ -9,7 +9,7 @@ plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'SimHei', 'Microsoft Y
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
 
 from models import get_model
-from data_utils import load_mnist, split_data_to_clients, create_data_loaders
+from data_utils import load_mnist, load_cifar10, split_data_to_clients, create_data_loaders
 from client import Client, DPConfig
 from edge_server import EdgeServer
 from cloud_server import CloudServer
@@ -19,6 +19,10 @@ from dynamic_weights import DynamicWeightAdjuster
 
 def main():
     # ==================== 配置参数 ====================
+    # 模型架构选择
+    DATASET = 'mnist'                     # 数据集选择：'mnist' 或 'cifar10'
+    USE_TEACHER_STUDENT_ARCH = True       # 是否使用不同架构的教师-学生模型（True=论文方案，False=同架构互蒸馏）
+
     NUM_EDGES = 5                         # 边缘服务器数量
     NUM_CLIENTS_PER_EDGE = 10             # 每个边缘服务器的客户端数量
     NUM_CLIENTS = NUM_EDGES * NUM_CLIENTS_PER_EDGE  # 总客户端数量
@@ -82,6 +86,8 @@ def main():
         print(f"GPU设备名称: {torch.cuda.get_device_name(0)}")
         print(f"可用GPU数量: {torch.cuda.device_count()}")
         print(f"当前GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    print(f"数据集: {DATASET.upper()}")
+    print(f"模型架构: {'不同架构教师-学生模型（论文方案）' if USE_TEACHER_STUDENT_ARCH else '同架构互蒸馏'}")
     print(f"边缘服务器数量: {NUM_EDGES}")
     print(f"每个边缘服务器的客户端数量: {NUM_CLIENTS_PER_EDGE}")
     print(f"总客户端数量: {NUM_CLIENTS}")
@@ -139,8 +145,15 @@ def main():
         print(f"{'='*70}")
 
     # ==================== 加载数据 ====================
-    print(f"\n[1/6] 加载MNIST数据集...(训练集使用比例: {TRAIN_FRACTION * 100}%)")
-    train_dataset, test_dataset = load_mnist(train_fraction=TRAIN_FRACTION)
+    print(f"\n[1/6] 加载{DATASET.upper()}数据集...(训练集使用比例: {TRAIN_FRACTION * 100}%)")
+
+    if DATASET == 'mnist':
+        train_dataset, test_dataset = load_mnist(train_fraction=TRAIN_FRACTION)
+    elif DATASET == 'cifar10':
+        train_dataset, test_dataset = load_cifar10(train_fraction=TRAIN_FRACTION)
+    else:
+        raise ValueError(f"不支持的数据集: {DATASET}，请选择 'mnist' 或 'cifar10'")
+
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # ==================== 分配数据给客户端 ====================
@@ -164,7 +177,30 @@ def main():
 
     # ==================== 初始化模型和服务器 ====================
     print("[3/6] 初始化云服务器、边缘服务器和客户端...")
-    global_model = get_model()
+
+    # 根据配置选择模型架构
+    if USE_TEACHER_STUDENT_ARCH:
+        # 使用不同架构的教师-学生模型（论文方案）
+        if DATASET == 'mnist':
+            teacher_model_name = 'mnist_teacher'
+            student_model_name = 'mnist_student'
+        elif DATASET == 'cifar10':
+            teacher_model_name = 'cifar_teacher'
+            student_model_name = 'cifar_student'
+        else:
+            raise ValueError(f"未支持的数据集: {DATASET}")
+
+        # 全局模型使用学生模型（最终上传的是学生模型参数）
+        global_model = get_model(student_model_name)
+        print(f"  使用教师模型: {teacher_model_name}")
+        print(f"  使用学生模型: {student_model_name}")
+    else:
+        # 使用同架构互蒸馏（原方案）
+        global_model = get_model('lenet')
+        teacher_model_name = None
+        student_model_name = None
+        print(f"  使用模型: LeNet（同架构互蒸馏）")
+
     cloud_server = CloudServer(global_model, device=DEVICE)
 
     # 创建边缘服务器
@@ -179,7 +215,15 @@ def main():
     # 创建客户端
     clients = []
     for client_id in range(NUM_CLIENTS):
-        client = Client(client_id, client_loaders[client_id], device=DEVICE)
+        if USE_TEACHER_STUDENT_ARCH:
+            # 为每个客户端创建独立的教师和学生模型
+            teacher_model = get_model(teacher_model_name)
+            student_model = get_model(student_model_name)
+            client = Client(client_id, client_loaders[client_id], device=DEVICE,
+                          teacher_model=teacher_model, student_model=student_model)
+        else:
+            # 同架构互蒸馏：只创建一个模型
+            client = Client(client_id, client_loaders[client_id], device=DEVICE)
         clients.append(client)
 
         # 将客户端注册到对应的边缘服务器
@@ -252,90 +296,164 @@ def main():
             for client_id in selected_client_ids:
                 client = clients[client_id]
 
-                # ========== 阶段1: 教师训练 ==========
-                # 教师总是只用CE训练（不蒸馏学生）
-                teacher_train_loss = client.train(
-                    LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
-                    LR_DECAY, LR_DECAY_EPOCH,
-                    use_dp=USE_DP, dp_config=dp_config,
-                    use_distillation=False,  # 教师第一阶段只用CE
-                    temperature=DISTILL_TEMPERATURE,
-                    alpha=DISTILL_ALPHA,
-                    beta_feat=DISTILL_BETA,
-                    use_dp_distillation=USE_DP_DISTILLATION,
-                    weight_adjuster=None
-                )
-                teacher_losses.append(teacher_train_loss)
+                if USE_TEACHER_STUDENT_ARCH:
+                    # ========== 论文方案：不同架构的教师-学生模型 ==========
 
-                # 保存教师模型参数
-                # 1. 带DP的版本用于传递给学生（隐私保护）
-                teacher_params_with_dp = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
-
-                # 2. 不带DP的state_dict用于本地蒸馏目标（仅当不使用DP时）
-                if not USE_DP:
-                    teacher_state_dict = teacher_params_with_dp  # 不使用DP时，两者相同
-                else:
-                    # 使用DP时，保存当前模型的state_dict用于后续互蒸馏
-                    teacher_state_dict = copy.deepcopy(client.model.state_dict())
-
-                # ========== 阶段2: 学生蒸馏教师（使用CE+KL+MSE） ==========
-                # 将教师参数加载为学生的蒸馏目标
-                # 注意：这里需要先恢复教师的带DP参数到模型，再设为蒸馏目标
-                if USE_DP:
-                    # 使用DP时，需要从带DP的梯度重建参数
-                    # 但set_teacher_model需要state_dict，所以我们直接用teacher_state_dict
-                    client.set_teacher_model(teacher_state_dict)
-                else:
-                    client.set_teacher_model(teacher_params_with_dp)
-
-                # 学生训练（蒸馏教师）
-                student_train_loss = client.train(
-                    LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
-                    LR_DECAY, LR_DECAY_EPOCH,
-                    use_dp=USE_DP, dp_config=dp_config,
-                    use_distillation=USE_DISTILLATION,  # 学生总是蒸馏教师
-                    temperature=DISTILL_TEMPERATURE,
-                    alpha=DISTILL_ALPHA,
-                    beta_feat=DISTILL_BETA,
-                    use_dp_distillation=USE_DP_DISTILLATION,
-                    weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
-                )
-                student_losses.append(student_train_loss)
-
-                # 获取学生模型参数（用于上传，可能带DP）
-                student_params_for_upload = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
-
-                # 保存学生模型的state_dict（不加DP，用于蒸馏目标）
-                student_state_dict = copy.deepcopy(client.model.state_dict())
-
-                # ========== 阶段3: 如果互蒸馏已启动，教师蒸馏学生 ==========
-                if distillation_enabled:
-                    # 互蒸馏已启动：教师再次训练，这次蒸馏学生
-                    # 将学生参数设为教师的蒸馏目标
-                    client.model.load_state_dict(teacher_state_dict)  # 恢复教师参数
-                    client.set_teacher_model(student_state_dict)  # 学生作为教师的蒸馏目标
-
-                    mutual_teacher_loss = client.train(
+                    # ========== 阶段1: 教师模型训练（只用CE，不蒸馏） ==========
+                    client.switch_to_teacher()
+                    teacher_train_loss = client.train(
                         LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
                         LR_DECAY, LR_DECAY_EPOCH,
                         use_dp=USE_DP, dp_config=dp_config,
-                        use_distillation=True,  # 教师蒸馏学生
+                        use_distillation=False,  # 教师只用CE训练
+                        temperature=DISTILL_TEMPERATURE,
+                        alpha=DISTILL_ALPHA,
+                        beta_feat=DISTILL_BETA,
+                        use_dp_distillation=USE_DP_DISTILLATION,
+                        weight_adjuster=None
+                    )
+                    teacher_losses.append(teacher_train_loss)
+
+                    # 保存教师模型的state_dict用于蒸馏
+                    teacher_state_dict = client.get_teacher_state_dict()
+
+                    # ========== 阶段2: 学生模型蒸馏教师 ==========
+                    client.switch_to_student()
+                    client.set_distillation_teacher(teacher_state_dict)
+
+                    student_train_loss = client.train(
+                        LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                        LR_DECAY, LR_DECAY_EPOCH,
+                        use_dp=USE_DP, dp_config=dp_config,
+                        use_distillation=USE_DISTILLATION,  # 学生蒸馏教师
                         temperature=DISTILL_TEMPERATURE,
                         alpha=DISTILL_ALPHA,
                         beta_feat=DISTILL_BETA,
                         use_dp_distillation=USE_DP_DISTILLATION,
                         weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
                     )
+                    student_losses.append(student_train_loss)
 
-                    # 注意：无论教师是否蒸馏学生，上传的始终是学生参数
-                    client_models[client_id] = student_params_for_upload
-                    print(f"  客户端 {client_id} 训练完成 [互蒸馏] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}, 互蒸馏教师损失: {mutual_teacher_loss:.4f}")
+                    # 保存学生模型的state_dict
+                    student_state_dict = client.get_student_state_dict()
+
+                    # ========== 阶段3: 如果互蒸馏已启动，教师蒸馏学生 ==========
+                    if distillation_enabled:
+                        client.switch_to_teacher()
+                        client.set_distillation_teacher(student_state_dict)
+
+                        mutual_teacher_loss = client.train(
+                            LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                            LR_DECAY, LR_DECAY_EPOCH,
+                            use_dp=USE_DP, dp_config=dp_config,
+                            use_distillation=True,  # 教师蒸馏学生
+                            temperature=DISTILL_TEMPERATURE,
+                            alpha=DISTILL_ALPHA,
+                            beta_feat=DISTILL_BETA,
+                            use_dp_distillation=USE_DP_DISTILLATION,
+                            weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
+                        )
+
+                        # 上传学生模型参数（带DP）
+                        client.switch_to_student()
+                        student_params_for_upload = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
+                        client_models[client_id] = student_params_for_upload
+                        print(f"  客户端 {client_id} 训练完成 [互蒸馏] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}, 互蒸馏教师损失: {mutual_teacher_loss:.4f}")
+                    else:
+                        # 上传学生模型参数（带DP）
+                        student_params_for_upload = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
+                        client_models[client_id] = student_params_for_upload
+                        print(f"  客户端 {client_id} 训练完成 [单向T→S] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}")
+
+                    round_client_losses.append(student_train_loss)
+
                 else:
-                    # 未达标，只上传学生参数
-                    client_models[client_id] = student_params_for_upload
-                    print(f"  客户端 {client_id} 训练完成 [单向S→T] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}")
+                    # ========== 原方案：同架构互蒸馏 ==========
 
-                round_client_losses.append(student_train_loss)  # 记录学生损失
+                    # ========== 阶段1: 教师训练 ==========
+                    # 教师总是只用CE训练（不蒸馏学生）
+                    teacher_train_loss = client.train(
+                        LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                        LR_DECAY, LR_DECAY_EPOCH,
+                        use_dp=USE_DP, dp_config=dp_config,
+                        use_distillation=False,  # 教师第一阶段只用CE
+                        temperature=DISTILL_TEMPERATURE,
+                        alpha=DISTILL_ALPHA,
+                        beta_feat=DISTILL_BETA,
+                        use_dp_distillation=USE_DP_DISTILLATION,
+                        weight_adjuster=None
+                    )
+                    teacher_losses.append(teacher_train_loss)
+
+                    # 保存教师模型参数
+                    # 1. 带DP的版本用于传递给学生（隐私保护）
+                    teacher_params_with_dp = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
+
+                    # 2. 不带DP的state_dict用于本地蒸馏目标（仅当不使用DP时）
+                    if not USE_DP:
+                        teacher_state_dict = teacher_params_with_dp  # 不使用DP时，两者相同
+                    else:
+                        # 使用DP时，保存当前模型的state_dict用于后续互蒸馏
+                        teacher_state_dict = copy.deepcopy(client.model.state_dict())
+
+                    # ========== 阶段2: 学生蒸馏教师（使用CE+KL+MSE） ==========
+                    # 将教师参数加载为学生的蒸馏目标
+                    # 注意：这里需要先恢复教师的带DP参数到模型，再设为蒸馏目标
+                    if USE_DP:
+                        # 使用DP时，需要从带DP的梯度重建参数
+                        # 但set_distillation_teacher需要state_dict，所以我们直接用teacher_state_dict
+                        client.set_distillation_teacher(teacher_state_dict)
+                    else:
+                        client.set_distillation_teacher(teacher_params_with_dp)
+
+                    # 学生训练（蒸馏教师）
+                    student_train_loss = client.train(
+                        LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                        LR_DECAY, LR_DECAY_EPOCH,
+                        use_dp=USE_DP, dp_config=dp_config,
+                        use_distillation=USE_DISTILLATION,  # 学生总是蒸馏教师
+                        temperature=DISTILL_TEMPERATURE,
+                        alpha=DISTILL_ALPHA,
+                        beta_feat=DISTILL_BETA,
+                        use_dp_distillation=USE_DP_DISTILLATION,
+                        weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
+                    )
+                    student_losses.append(student_train_loss)
+
+                    # 获取学生模型参数（用于上传，可能带DP）
+                    student_params_for_upload = client.get_model_parameters(use_dp=USE_DP, dp_config=dp_config)
+
+                    # 保存学生模型的state_dict（不加DP，用于蒸馏目标）
+                    student_state_dict = copy.deepcopy(client.model.state_dict())
+
+                    # ========== 阶段3: 如果互蒸馏已启动，教师蒸馏学生 ==========
+                    if distillation_enabled:
+                        # 互蒸馏已启动：教师再次训练，这次蒸馏学生
+                        # 将学生参数设为教师的蒸馏目标
+                        client.model.load_state_dict(teacher_state_dict)  # 恢复教师参数
+                        client.set_distillation_teacher(student_state_dict)  # 学生作为教师的蒸馏目标
+
+                        mutual_teacher_loss = client.train(
+                            LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY,
+                            LR_DECAY, LR_DECAY_EPOCH,
+                            use_dp=USE_DP, dp_config=dp_config,
+                            use_distillation=True,  # 教师蒸馏学生
+                            temperature=DISTILL_TEMPERATURE,
+                            alpha=DISTILL_ALPHA,
+                            beta_feat=DISTILL_BETA,
+                            use_dp_distillation=USE_DP_DISTILLATION,
+                            weight_adjuster=weight_adjusters.get(client_id) if USE_DYNAMIC_WEIGHTS else None
+                        )
+
+                        # 注意：无论教师是否蒸馏学生，上传的始终是学生参数
+                        client_models[client_id] = student_params_for_upload
+                        print(f"  客户端 {client_id} 训练完成 [互蒸馏] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}, 互蒸馏教师损失: {mutual_teacher_loss:.4f}")
+                    else:
+                        # 未达标，只上传学生参数
+                        client_models[client_id] = student_params_for_upload
+                        print(f"  客户端 {client_id} 训练完成 [单向S→T] - 教师损失: {teacher_train_loss:.4f}, 学生损失: {student_train_loss:.4f}")
+
+                    round_client_losses.append(student_train_loss)  # 记录学生损失
 
                 # TensorBoard: 记录每个客户端的训练损失
                 if writer:

@@ -9,7 +9,7 @@ from privacy import Flatten_gradients, local_process, reshape_gradients
 class Client:
     """客户端类（支持差分隐私 + 知识蒸馏）"""
 
-    def __init__(self, client_id, data_loader, device='cpu'):
+    def __init__(self, client_id, data_loader, device='cpu', teacher_model=None, student_model=None):
         """
         初始化客户端
 
@@ -17,13 +17,17 @@ class Client:
             client_id: 客户端ID
             data_loader: 该客户端的数据加载器
             device: 计算设备
+            teacher_model: 教师模型实例（可选，用于不同架构的教师-学生）
+            student_model: 学生模型实例（可选，用于不同架构的教师-学生）
         """
         self.client_id = client_id
         self.data_loader = data_loader
         self.device = device
-        self.model = None
+        self.model = None  # 当前正在训练的模型
         self.initial_params = None  # 保存初始参数用于计算梯度
-        self.teacher_model = None  # 教师模型（用于知识蒸馏）
+        self.teacher_model = teacher_model  # 本地教师模型
+        self.student_model = student_model  # 本地学生模型
+        self.distillation_teacher = None  # 用于蒸馏的目标教师模型
 
     def set_model(self, global_model):
         """接收来自边缘服务器的全局模型"""
@@ -32,14 +36,77 @@ class Client:
         # 保存初始参数
         self.initial_params = copy.deepcopy(self.model.state_dict())
 
-    def set_teacher_model(self, teacher_model_state):
-        """设置教师模型（用于知识蒸馏）"""
-        if self.teacher_model is None:
-            from models import get_model
-            self.teacher_model = get_model()
-        self.teacher_model.load_state_dict(teacher_model_state)
-        self.teacher_model.to(self.device)
-        self.teacher_model.eval()
+    def set_teacher_model_state(self, teacher_model_state):
+        """设置教师模型的参数（用于从全局模型同步）"""
+        if self.teacher_model is not None:
+            self.teacher_model.load_state_dict(teacher_model_state)
+            self.teacher_model.to(self.device)
+
+    def set_student_model_state(self, student_model_state):
+        """设置学生模型的参数（用于从全局模型同步）"""
+        if self.student_model is not None:
+            self.student_model.load_state_dict(student_model_state)
+            self.student_model.to(self.device)
+
+    def set_distillation_teacher(self, teacher_model_state):
+        """设置用于蒸馏的目标教师模型"""
+        if self.distillation_teacher is None:
+            # 创建与当前正在训练的模型相同架构的模型
+            if self.model is self.teacher_model:
+                from models import get_model
+                # 根据teacher_model的类型创建
+                model_type = type(self.teacher_model).__name__
+                if model_type == 'MnistTeacher':
+                    self.distillation_teacher = get_model('mnist_teacher')
+                elif model_type == 'MnistStudent':
+                    self.distillation_teacher = get_model('mnist_student')
+                elif model_type == 'CifarTeacher':
+                    self.distillation_teacher = get_model('cifar_teacher')
+                elif model_type == 'CifarStudent':
+                    self.distillation_teacher = get_model('cifar_student')
+                else:
+                    self.distillation_teacher = get_model('lenet')
+            else:
+                from models import get_model
+                model_type = type(self.student_model).__name__
+                if model_type == 'MnistTeacher':
+                    self.distillation_teacher = get_model('mnist_teacher')
+                elif model_type == 'MnistStudent':
+                    self.distillation_teacher = get_model('mnist_student')
+                elif model_type == 'CifarTeacher':
+                    self.distillation_teacher = get_model('cifar_teacher')
+                elif model_type == 'CifarStudent':
+                    self.distillation_teacher = get_model('cifar_student')
+                else:
+                    self.distillation_teacher = get_model('lenet')
+
+        self.distillation_teacher.load_state_dict(teacher_model_state)
+        self.distillation_teacher.to(self.device)
+        self.distillation_teacher.eval()
+
+    def switch_to_teacher(self):
+        """切换到教师模型进行训练"""
+        if self.teacher_model is not None:
+            self.model = self.teacher_model
+            self.initial_params = copy.deepcopy(self.model.state_dict())
+
+    def switch_to_student(self):
+        """切换到学生模型进行训练"""
+        if self.student_model is not None:
+            self.model = self.student_model
+            self.initial_params = copy.deepcopy(self.model.state_dict())
+
+    def get_teacher_state_dict(self):
+        """获取教师模型的state_dict"""
+        if self.teacher_model is not None:
+            return copy.deepcopy(self.teacher_model.state_dict())
+        return None
+
+    def get_student_state_dict(self):
+        """获取学生模型的state_dict"""
+        if self.student_model is not None:
+            return copy.deepcopy(self.student_model.state_dict())
+        return None
 
     def train(self, epochs, learning_rate, momentum=0, weight_decay=0,
               lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None,
@@ -103,7 +170,7 @@ class Client:
                 optimizer.zero_grad()
 
                 # 学生模型前向传播
-                if use_distillation and self.teacher_model is not None:
+                if use_distillation and self.distillation_teacher is not None:
                     student_output, student_features = self.model(data, return_features=True)
                 else:
                     student_output = self.model(data, return_features=False)
@@ -112,29 +179,37 @@ class Client:
                 ce_loss = criterion(student_output, target)
 
                 # 2. KL散度 + 3. 特征MSE（如果启用蒸馏）
-                if use_distillation and self.teacher_model is not None:
+                if use_distillation and self.distillation_teacher is not None:
                     with torch.no_grad():
-                        teacher_output, teacher_features = self.teacher_model(data, return_features=True)
+                        teacher_output, teacher_features = self.distillation_teacher(data, return_features=True)
 
                         # 对教师模型的输出添加差分隐私噪声
                         if use_dp_distillation and dp_config is not None:
                             teacher_output = self._add_noise_to_teacher_output(teacher_output, dp_config)
-                            teacher_features['fc2'] = self._add_noise_to_teacher_features(
-                                teacher_features['fc2'], dp_config
+                            # 根据模型类型选择特征层
+                            feature_key = 'distill_features' if 'distill_features' in teacher_features else 'fc2'
+                            teacher_features[feature_key] = self._add_noise_to_teacher_features(
+                                teacher_features[feature_key], dp_config
                             )
 
                     # KL散度损失（软标签）
                     kl_loss = self._compute_kl_loss(student_output, teacher_output, temperature)
 
-                    # 特征MSE损失（使用fc2层特征）
+                    # 特征MSE损失（使用蒸馏特征层）
+                    # 根据模型类型选择特征层
+                    feature_key = 'distill_features' if 'distill_features' in student_features else 'fc2'
+
                     # 使用标准化而非归一化，保留幅度信息但统一尺度
-                    teacher_feat_mean = teacher_features['fc2'].mean()
-                    teacher_feat_std = teacher_features['fc2'].std() + 1e-8
+                    teacher_feat_mean = teacher_features[feature_key].mean()
+                    teacher_feat_std = teacher_features[feature_key].std() + 1e-8
 
-                    student_feat_scaled = (student_features['fc2'] - student_features['fc2'].mean()) / (student_features['fc2'].std() + 1e-8)
-                    teacher_feat_scaled = (teacher_features['fc2'] - teacher_feat_mean) / teacher_feat_std
+                    student_feat_scaled = (student_features[feature_key] - student_features[feature_key].mean()) / (student_features[feature_key].std() + 1e-8)
+                    teacher_feat_scaled = (teacher_features[feature_key] - teacher_feat_mean) / teacher_feat_std
 
-                    feat_loss = mse_criterion(student_feat_scaled, teacher_feat_scaled)
+                    feat_loss_raw = mse_criterion(student_feat_scaled, teacher_feat_scaled)
+
+                    # 缩放MSE使其与CE/KL同数量级（除以10-20让MSE≈0.1左右）
+                    feat_loss = feat_loss_raw / 15.0
 
                     # 动态调整权重（如果启用）
                     if weight_adjuster is not None:
