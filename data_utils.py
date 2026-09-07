@@ -415,7 +415,10 @@ def analyze_data_distribution(train_dataset, client_data_indices, num_edges, num
         class_dist = [client_class_counts[cid][class_id] for cid in range(num_clients)]
         class_distributions.append(class_dist)
 
-    bp = ax6.boxplot(class_distributions, labels=range(num_classes), patch_artist=True)
+    try:
+        bp = ax6.boxplot(class_distributions, tick_labels=range(num_classes), patch_artist=True)
+    except TypeError:
+        bp = ax6.boxplot(class_distributions, labels=range(num_classes), patch_artist=True)
     for patch, color in zip(bp['boxes'], colors):
         patch.set_facecolor(color)
     ax6.set_xlabel('类别', fontsize=12)
