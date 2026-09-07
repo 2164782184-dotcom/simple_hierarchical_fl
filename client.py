@@ -28,6 +28,7 @@ class Client:
         self.teacher_model = teacher_model  # 本地教师模型
         self.student_model = student_model  # 本地学生模型
         self.distillation_teacher = None  # 用于蒸馏的目标教师模型
+        self.feature_transform = None  # 特征转换层（用于对齐不同维度的特征）
 
     def set_model(self, global_model):
         """接收来自边缘服务器的全局模型"""
@@ -35,6 +36,12 @@ class Client:
         self.model.to(self.device)
         # 保存初始参数
         self.initial_params = copy.deepcopy(self.model.state_dict())
+
+        # 如果使用不同架构的教师-学生模型，需要同步学生模型的参数
+        # （全局模型使用的是学生模型架构）
+        if self.student_model is not None:
+            self.student_model.load_state_dict(self.model.state_dict())
+            self.student_model.to(self.device)
 
     def set_teacher_model_state(self, teacher_model_state):
         """设置教师模型的参数（用于从全局模型同步）"""
@@ -49,40 +56,92 @@ class Client:
             self.student_model.to(self.device)
 
     def set_distillation_teacher(self, teacher_model_state):
-        """设置用于蒸馏的目标教师模型"""
-        if self.distillation_teacher is None:
-            # 创建与当前正在训练的模型相同架构的模型
-            if self.model is self.teacher_model:
-                from models import get_model
-                # 根据teacher_model的类型创建
-                model_type = type(self.teacher_model).__name__
-                if model_type == 'MnistTeacher':
-                    self.distillation_teacher = get_model('mnist_teacher')
-                elif model_type == 'MnistStudent':
-                    self.distillation_teacher = get_model('mnist_student')
-                elif model_type == 'CifarTeacher':
-                    self.distillation_teacher = get_model('cifar_teacher')
-                elif model_type == 'CifarStudent':
-                    self.distillation_teacher = get_model('cifar_student')
+        """设置用于蒸馏的目标教师模型，并创建特征转换层（如果需要）"""
+        # 根据传入的state_dict判断应该创建什么类型的模型
+        # 通过检查第一个卷积层的形状来判断模型类型
+        conv1_weight_shape = teacher_model_state['conv1.weight'].shape
+
+        # 根据conv1的通道数判断模型类型
+        in_channels = conv1_weight_shape[1]  # 输入通道
+        out_channels = conv1_weight_shape[0]  # 输出通道
+
+        # 检查fc1的形状来区分LeNet和MnistStudent/MnistTeacher
+        fc1_out_features = teacher_model_state['fc1.weight'].shape[0]
+
+        # 确定需要创建的模型类型
+        model_name = None
+        if in_channels == 1:  # MNIST
+            if out_channels == 10:
+                model_name = 'mnist_teacher'
+            elif out_channels == 6:
+                # 区分LeNet和MnistStudent
+                if fc1_out_features == 120:  # LeNet: fc1输出120
+                    model_name = 'lenet'
+                elif fc1_out_features == 50:  # MnistStudent: fc1输出50
+                    model_name = 'mnist_student'
                 else:
-                    self.distillation_teacher = get_model('lenet')
+                    model_name = 'lenet'  # 默认
             else:
-                from models import get_model
-                model_type = type(self.student_model).__name__
-                if model_type == 'MnistTeacher':
-                    self.distillation_teacher = get_model('mnist_teacher')
-                elif model_type == 'MnistStudent':
-                    self.distillation_teacher = get_model('mnist_student')
-                elif model_type == 'CifarTeacher':
-                    self.distillation_teacher = get_model('cifar_teacher')
-                elif model_type == 'CifarStudent':
-                    self.distillation_teacher = get_model('cifar_student')
-                else:
-                    self.distillation_teacher = get_model('lenet')
+                model_name = 'lenet'
+        elif in_channels == 3:  # CIFAR-10
+            if out_channels == 32:
+                model_name = 'cifar_teacher'
+            elif out_channels == 16:
+                model_name = 'cifar_student'
+            else:
+                model_name = 'lenet'
+        else:
+            # 默认情况
+            model_name = 'lenet'
+
+        # 检查是否需要重新创建模型（类型改变了）
+        need_recreate = False
+        if self.distillation_teacher is None:
+            need_recreate = True
+        else:
+            # 检查现有模型类型是否匹配
+            current_model_type = type(self.distillation_teacher).__name__
+            if model_name == 'mnist_teacher' and current_model_type != 'MnistTeacher':
+                need_recreate = True
+            elif model_name == 'mnist_student' and current_model_type != 'MnistStudent':
+                need_recreate = True
+            elif model_name == 'cifar_teacher' and current_model_type != 'CifarTeacher':
+                need_recreate = True
+            elif model_name == 'cifar_student' and current_model_type != 'CifarStudent':
+                need_recreate = True
+            elif model_name == 'lenet' and current_model_type != 'LeNet':
+                need_recreate = True
+
+        # 如果需要，重新创建模型
+        if need_recreate:
+            from models import get_model
+            self.distillation_teacher = get_model(model_name)
+            self.distillation_teacher.to(self.device)
 
         self.distillation_teacher.load_state_dict(teacher_model_state)
-        self.distillation_teacher.to(self.device)
         self.distillation_teacher.eval()
+
+        # 创建特征转换层φ：用于对齐学生和教师的特征维度
+        # 获取一个样本来推断特征维度
+        sample_input = next(iter(self.data_loader))[0][:1].to(self.device)
+
+        with torch.no_grad():
+            _, student_features = self.model(sample_input, return_features=True)
+            _, teacher_features = self.distillation_teacher(sample_input, return_features=True)
+
+        # 确定使用哪个特征键
+        feature_key_student = 'distill_features' if 'distill_features' in student_features else 'fc2'
+        feature_key_teacher = 'distill_features' if 'distill_features' in teacher_features else 'fc2'
+
+        student_feat_dim = student_features[feature_key_student].shape[1]
+        teacher_feat_dim = teacher_features[feature_key_teacher].shape[1]
+
+        # 如果特征维度不同，创建线性变换层
+        if student_feat_dim != teacher_feat_dim:
+            self.feature_transform = nn.Linear(student_feat_dim, teacher_feat_dim).to(self.device)
+            print(f"  [客户端{self.client_id}] 创建特征转换层: {student_feat_dim} -> {teacher_feat_dim}")
+        else:
+            self.feature_transform = None
 
     def switch_to_teacher(self):
         """切换到教师模型进行训练"""
@@ -199,17 +258,22 @@ class Client:
                     # 根据模型类型选择特征层
                     feature_key = 'distill_features' if 'distill_features' in student_features else 'fc2'
 
+                    # 获取学生和教师的特征
+                    student_feat = student_features[feature_key]
+                    teacher_feat = teacher_features[feature_key]
+
+                    # 如果存在特征转换层，应用φ变换对齐维度
+                    if self.feature_transform is not None:
+                        student_feat = self.feature_transform(student_feat)
+
                     # 使用标准化而非归一化，保留幅度信息但统一尺度
-                    teacher_feat_mean = teacher_features[feature_key].mean()
-                    teacher_feat_std = teacher_features[feature_key].std() + 1e-8
+                    teacher_feat_mean = teacher_feat.mean()
+                    teacher_feat_std = teacher_feat.std() + 1e-8
 
-                    student_feat_scaled = (student_features[feature_key] - student_features[feature_key].mean()) / (student_features[feature_key].std() + 1e-8)
-                    teacher_feat_scaled = (teacher_features[feature_key] - teacher_feat_mean) / teacher_feat_std
+                    student_feat_scaled = (student_feat - student_feat.mean()) / (student_feat.std() + 1e-8)
+                    teacher_feat_scaled = (teacher_feat - teacher_feat_mean) / teacher_feat_std
 
-                    feat_loss_raw = mse_criterion(student_feat_scaled, teacher_feat_scaled)
-
-                    # 缩放MSE使其与CE/KL同数量级（除以10-20让MSE≈0.1左右）
-                    feat_loss = feat_loss_raw / 15.0
+                    feat_loss = mse_criterion(student_feat_scaled, teacher_feat_scaled)
 
                     # 动态调整权重（如果启用）
                     if weight_adjuster is not None:

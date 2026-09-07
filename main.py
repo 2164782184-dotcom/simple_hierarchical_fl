@@ -21,7 +21,7 @@ def main():
     # ==================== 配置参数 ====================
     # 模型架构选择
     DATASET = 'mnist'                     # 数据集选择：'mnist' 或 'cifar10'
-    USE_TEACHER_STUDENT_ARCH = True       # 是否使用不同架构的教师-学生模型（True=论文方案，False=同架构互蒸馏）
+    USE_TEACHER_STUDENT_ARCH = False       # 是否使用不同架构的教师-学生模型（True=论文方案，False=同架构互蒸馏）
 
     NUM_EDGES = 5                         # 边缘服务器数量
     NUM_CLIENTS_PER_EDGE = 10             # 每个边缘服务器的客户端数量
@@ -64,7 +64,7 @@ def main():
     USE_PRIVACY_ACCOUNTANT = False        # 是否启用隐私预算统计（关闭以避免超标警告）
 
     # ==================== TensorBoard配置 ====================
-    USE_TENSORBOARD = False                # 是否启用TensorBoard实时可视化
+    USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
 
     # ==================== 设置随机种子 ====================
     import random
@@ -219,6 +219,9 @@ def main():
             # 为每个客户端创建独立的教师和学生模型
             teacher_model = get_model(teacher_model_name)
             student_model = get_model(student_model_name)
+            # 将模型移到设备上
+            teacher_model.to(DEVICE)
+            student_model.to(DEVICE)
             client = Client(client_id, client_loaders[client_id], device=DEVICE,
                           teacher_model=teacher_model, student_model=student_model)
         else:
