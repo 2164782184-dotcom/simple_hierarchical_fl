@@ -38,7 +38,7 @@ def main():
     DP_DELTA = 0.001                      # 失败概率（典型值：1e-5 到 1e-7）
     DP_CLIP_C = 0.01                      # 梯度裁剪阈值
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
-    DP_MECHANISM = 'laplace'              # 噪声机制（'laplace' 或 'gaussian'）
+    DP_MECHANISM = 'gaussian'              # 噪声机制（'laplace' 或 'gaussian'）
 
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
@@ -139,6 +139,7 @@ def main():
         cloud_server.distribute_model_to_edges()
 
         edge_models = {}
+        edge_weights = {}  # 新增：记录边缘服务器的数据量
         round_client_losses = []  # 记录本轮所有客户端的损失
 
         # 对每个边缘服务器
@@ -150,6 +151,7 @@ def main():
 
             # 步骤3: 客户端本地训练
             client_models = {}
+            client_weights = {}  # 新增：记录客户端数据量
             for client_id in edge_server.client_ids:
                 client = clients[client_id]
 
@@ -162,20 +164,27 @@ def main():
                     use_dp=USE_DP, dp_config=dp_config
                 )
 
-                print(f"  客户端 {client_id} 训练完成, 损失: {train_loss:.4f}")
+                # 获取客户端数据量作为权重
+                client_weights[client_id] = len(client.data_loader.dataset)
+
+                print(f"  客户端 {client_id} 训练完成, 损失: {train_loss:.4f}, 数据量: {client_weights[client_id]}")
                 round_client_losses.append(train_loss)
 
                 # TensorBoard: 记录每个客户端的训练损失
                 if writer:
                     writer.add_scalar(f'Client/Loss_Client_{client_id}', train_loss, round_idx)
 
-            # 步骤4: 边缘服务器聚合客户端模型
-            edge_server.aggregate_client_models(client_models, use_dp=USE_DP)
+            # 步骤4: 边缘服务器聚合客户端模型（加权平均）
+            edge_server.aggregate_client_models(client_models, client_weights, use_dp=USE_DP)
             edge_models[edge_server.edge_id] = edge_server.get_model_parameters()
-            print(f"  边缘服务器 {edge_server.edge_id} 聚合完成")
 
-        # 步骤5: 云服务器聚合边缘服务器模型
-        cloud_server.aggregate_edge_models(edge_models)
+            # 计算该边缘服务器管理的总数据量作为权重
+            edge_weights[edge_server.edge_id] = sum(client_weights.values())
+
+            print(f"  边缘服务器 {edge_server.edge_id} 聚合完成, 总数据量: {edge_weights[edge_server.edge_id]}")
+
+        # 步骤5: 云服务器聚合边缘服务器模型（加权平均）
+        cloud_server.aggregate_edge_models(edge_models, edge_weights)
         print(f"\n云服务器聚合完成")
 
         # 计算本轮平均客户端损失

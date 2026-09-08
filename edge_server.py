@@ -36,14 +36,15 @@ class EdgeServer:
             if client_id in self.clients:
                 self.clients[client_id].set_model(self.model)
 
-    def aggregate_client_models(self, client_models, use_dp=False):
+    def aggregate_client_models(self, client_models, client_weights, use_dp=False):
         """
-        聚合客户端模型参数（支持差分隐私）
+        聚合客户端模型参数（支持差分隐私 + 加权平均）
 
         Args:
             client_models: 字典，key为客户端ID
                          - 不使用DP：value为模型参数字典
                          - 使用DP：value为 (梯度向量, top-k索引, 梯度形状) 元组
+            client_weights: 字典，key为客户端ID，value为权重（数据量）
             use_dp: 是否使用差分隐私
 
         Returns:
@@ -53,18 +54,19 @@ class EdgeServer:
             return self.model.state_dict()
 
         if not use_dp:
-            # 标准FedAvg聚合
-            return self._aggregate_standard(client_models)
+            # 标准FedAvg聚合（加权平均）
+            return self._aggregate_standard(client_models, client_weights)
         else:
-            # 差分隐私聚合
-            return self._aggregate_with_dp(client_models)
+            # 差分隐私聚合（加权平均）
+            return self._aggregate_with_dp(client_models, client_weights)
 
-    def _aggregate_standard(self, client_models):
+    def _aggregate_standard(self, client_models, client_weights):
         """
-        标准FedAvg聚合（不使用差分隐私）
+        标准FedAvg聚合（加权平均，不使用差分隐私）
 
         Args:
             client_models: 字典，key为客户端ID，value为模型参数
+            client_weights: 字典，key为客户端ID，value为权重（数据量）
 
         Returns:
             聚合后的模型参数
@@ -75,27 +77,31 @@ class EdgeServer:
         # 获取第一个客户端的参数作为模板
         first_client_params = list(client_models.values())[0]
 
-        # 对每个参数进行平均
-        for key in first_client_params.keys():
-            # 将所有客户端的该参数相加
-            aggregated_params[key] = torch.zeros_like(first_client_params[key])
-            for client_id, params in client_models.items():
-                aggregated_params[key] += params[key]
+        # 计算总权重
+        total_weight = sum(client_weights.values())
 
-            # 取平均
-            aggregated_params[key] = aggregated_params[key] / len(client_models)
+        # 对每个参数进行加权平均
+        for key in first_client_params.keys():
+            aggregated_params[key] = torch.zeros_like(first_client_params[key])
+
+            for client_id, params in client_models.items():
+                # 计算该客户端的权重占比
+                weight = client_weights[client_id] / total_weight
+                # 加权累加
+                aggregated_params[key] += params[key] * weight
 
         # 更新边缘服务器的模型
         self.model.load_state_dict(aggregated_params)
 
         return aggregated_params
 
-    def _aggregate_with_dp(self, client_models):
+    def _aggregate_with_dp(self, client_models, client_weights):
         """
-        差分隐私聚合（处理稀疏梯度）
+        差分隐私聚合（处理稀疏梯度 + 加权平均）
 
         Args:
             client_models: 字典，key为客户端ID，value为(梯度向量, top-k索引, 梯度形状)
+            client_weights: 字典，key为客户端ID，value为权重（数据量）
 
         Returns:
             聚合后的模型参数
@@ -107,12 +113,15 @@ class EdgeServer:
         # 初始化聚合后的梯度向量（全零）
         aggregated_gradient = torch.zeros_like(gradient_vector)
 
-        # 累加所有客户端的梯度
-        for client_id, (grad_vector, choices, _) in client_models.items():
-            aggregated_gradient += grad_vector
+        # 计算总权重
+        total_weight = sum(client_weights.values())
 
-        # 取平均
-        aggregated_gradient = aggregated_gradient / len(client_models)
+        # 加权累加所有客户端的梯度
+        for client_id, (grad_vector, choices, _) in client_models.items():
+            # 计算该客户端的权重占比
+            weight = client_weights[client_id] / total_weight
+            # 加权累加
+            aggregated_gradient += grad_vector * weight
 
         # 将展平的梯度重塑回原始形状
         gradient_list = reshape_gradients(aggregated_gradient, shapes)

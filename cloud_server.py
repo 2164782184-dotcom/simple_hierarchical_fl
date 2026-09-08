@@ -26,12 +26,13 @@ class CloudServer:
         for edge_id, edge_server in self.edge_servers.items():
             edge_server.set_model(self.model)
 
-    def aggregate_edge_models(self, edge_models):
+    def aggregate_edge_models(self, edge_models, edge_weights):
         """
-        聚合边缘服务器模型参数（FedAvg算法）
+        聚合边缘服务器模型参数（加权 FedAvg 算法）
 
         Args:
             edge_models: 字典，key为边缘服务器ID，value为模型参数
+            edge_weights: 字典，key为边缘服务器ID，value为权重（数据量）
 
         Returns:
             聚合后的模型参数
@@ -45,15 +46,18 @@ class CloudServer:
         # 获取第一个边缘服务器的参数作为模板
         first_edge_params = list(edge_models.values())[0]
 
-        # 对每个参数进行平均
-        for key in first_edge_params.keys():
-            # 将所有边缘服务器的该参数相加
-            aggregated_params[key] = torch.zeros_like(first_edge_params[key])
-            for edge_id, params in edge_models.items():
-                aggregated_params[key] += params[key]
+        # 计算总权重
+        total_weight = sum(edge_weights.values())
 
-            # 取平均
-            aggregated_params[key] = aggregated_params[key] / len(edge_models)
+        # 对每个参数进行加权平均
+        for key in first_edge_params.keys():
+            aggregated_params[key] = torch.zeros_like(first_edge_params[key])
+
+            for edge_id, params in edge_models.items():
+                # 计算该边缘服务器的权重占比
+                weight = edge_weights[edge_id] / total_weight
+                # 加权累加
+                aggregated_params[key] += params[key] * weight
 
         # 更新云服务器的全局模型
         self.model.load_state_dict(aggregated_params)
