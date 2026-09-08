@@ -12,6 +12,7 @@ from data_utils import load_mnist, split_data_to_clients, create_data_loaders
 from client import Client, DPConfig
 from edge_server import EdgeServer
 from cloud_server import CloudServer
+from communication_metrics import CommunicationMetrics
 
 
 def main():
@@ -139,6 +140,9 @@ def main():
     accuracy_history = []
     loss_history = []
 
+    # 初始化通讯量统计
+    comm_metrics = CommunicationMetrics()
+
     for round_idx in range(NUM_ROUNDS):
         print(f"{'='*70}")
         print(f"轮次 {round_idx + 1}/{NUM_ROUNDS}")
@@ -146,6 +150,9 @@ def main():
 
         # 步骤1: 云服务器分发模型给边缘服务器
         cloud_server.distribute_model_to_edges()
+
+        # 统计：云→边缘的下行通讯
+        comm_metrics.record_cloud_broadcast(NUM_EDGES, cloud_server.model.state_dict())
 
         edge_models = {}
         edge_weights = {}  # 新增：记录边缘服务器的数据量
@@ -157,6 +164,12 @@ def main():
 
             # 步骤2: 边缘服务器分发模型给客户端
             edge_server.distribute_model_to_clients()
+
+            # 统计：边缘→客户端的下行通讯
+            comm_metrics.record_edge_broadcast(
+                len(edge_server.client_ids),
+                edge_server.model.state_dict()
+            )
 
             # 步骤3: 客户端本地训练
             client_models = {}
@@ -186,6 +199,9 @@ def main():
                 if writer:
                     writer.add_scalar(f'Client/Loss_Client_{client_id}', train_loss, round_idx)
 
+            # 统计：客户端→边缘的上行通讯
+            comm_metrics.record_client_upload(client_models)
+
             # 步骤4: 边缘服务器聚合客户端模型（加权平均）
             edge_server.aggregate_client_models(client_models, client_weights,
                                                use_dp=USE_DP, use_compression=USE_COMPRESSION)
@@ -195,6 +211,9 @@ def main():
             edge_weights[edge_server.edge_id] = sum(client_weights.values())
 
             print(f"  边缘服务器 {edge_server.edge_id} 聚合完成, 总数据量: {edge_weights[edge_server.edge_id]}")
+
+        # 统计：边缘→云的上行通讯
+        comm_metrics.record_edge_upload(edge_models)
 
         # 步骤5: 云服务器聚合边缘服务器模型（加权平均）
         cloud_server.aggregate_edge_models(edge_models, edge_weights)
@@ -215,6 +234,15 @@ def main():
             writer.add_scalar('Global/Avg_Client_Train_Loss', avg_client_loss, round_idx)
             writer.add_scalar('Hyperparameters/Learning_Rate', LEARNING_RATE * (LR_DECAY ** round_idx), round_idx)
 
+            # 记录通讯量
+            summary = comm_metrics.get_summary()
+            writer.add_scalar('Communication/Total_MB', summary['total_communication_mb'], round_idx)
+            writer.add_scalar('Communication/Upload_MB', summary['upload_mb'], round_idx)
+            writer.add_scalar('Communication/Download_MB', summary['download_mb'], round_idx)
+
+        # 记录本轮结束
+        comm_metrics.record_round_end()
+
         print(f"\n轮次 {round_idx + 1} 结果:")
         print(f"  测试准确率: {accuracy:.2f}%")
         print(f"  测试损失: {test_loss:.4f}")
@@ -226,6 +254,9 @@ def main():
     print(f"{'='*70}")
     print(f"最终测试准确率: {accuracy_history[-1]:.2f}%")
     print(f"最终测试损失: {loss_history[-1]:.4f}")
+
+    # 打印通讯成本统计
+    comm_metrics.print_summary()
 
     # ==================== 绘制结果 ====================
     print("\n[5/6] 绘制训练曲线...")
