@@ -40,11 +40,15 @@ def main():
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'gaussian'              # 噪声机制（'laplace' 或 'gaussian'）
 
+    # ==================== 梯度压缩配置 ====================
+    USE_COMPRESSION = False               # 是否使用梯度压缩（独立于DP的Top-k稀疏化）
+    COMPRESSION_RATE = 50                 # 压缩率（rate=50 表示保留 2% 的梯度）
+
     # ==================== TensorBoard配置 ====================
     USE_TENSORBOARD = True                # 是否启用TensorBoard实时可视化
 
     print("="*70)
-    print("分层联邦学习 + 差分隐私 (Hierarchical FL with Differential Privacy)")
+    print("分层联邦学习 + 差分隐私 + 梯度压缩 (Hierarchical FL)")
     print("="*70)
     print(f"设备: {DEVICE}")
     print(f"边缘服务器数量: {NUM_EDGES}")
@@ -63,6 +67,11 @@ def main():
         print(f"  梯度裁剪阈值: {DP_CLIP_C}")
         print(f"  稀疏化率: {DP_RATE} (保留 {100/DP_RATE:.1f}% 的梯度)")
         print(f"  噪声机制: {DP_MECHANISM}")
+    print(f"\n{'='*70}")
+    print(f"梯度压缩配置:")
+    print(f"  启用状态: {'是' if USE_COMPRESSION else '否'}")
+    if USE_COMPRESSION:
+        print(f"  压缩率: {COMPRESSION_RATE} (保留 {100/COMPRESSION_RATE:.1f}% 的梯度)")
     print("="*70)
 
     # ==================== 初始化TensorBoard ====================
@@ -159,9 +168,12 @@ def main():
                 train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY, LR_DECAY, LR_DECAY_EPOCH,
                                          use_dp=USE_DP, dp_config=dp_config)
 
-                # 获取模型参数（如果使用DP，返回处理后的梯度）
+                # 获取模型参数（支持DP、压缩或完整参数）
                 client_models[client_id] = client.get_model_parameters(
-                    use_dp=USE_DP, dp_config=dp_config
+                    use_dp=USE_DP,
+                    dp_config=dp_config,
+                    use_compression=USE_COMPRESSION,
+                    compression_rate=COMPRESSION_RATE
                 )
 
                 # 获取客户端数据量作为权重
@@ -175,7 +187,8 @@ def main():
                     writer.add_scalar(f'Client/Loss_Client_{client_id}', train_loss, round_idx)
 
             # 步骤4: 边缘服务器聚合客户端模型（加权平均）
-            edge_server.aggregate_client_models(client_models, client_weights, use_dp=USE_DP)
+            edge_server.aggregate_client_models(client_models, client_weights,
+                                               use_dp=USE_DP, use_compression=USE_COMPRESSION)
             edge_models[edge_server.edge_id] = edge_server.get_model_parameters()
 
             # 计算该边缘服务器管理的总数据量作为权重

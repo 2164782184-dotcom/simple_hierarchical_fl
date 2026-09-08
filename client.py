@@ -85,23 +85,31 @@ class Client:
         avg_loss = total_loss / epochs
         return avg_loss
 
-    def get_model_parameters(self, use_dp=False, dp_config=None):
+    def get_model_parameters(self, use_dp=False, dp_config=None, use_compression=False, compression_rate=50):
         """
-        返回模型参数（支持差分隐私处理）
+        返回模型参数（支持差分隐私处理和梯度压缩）
 
         Args:
             use_dp: 是否使用差分隐私
             dp_config: 差分隐私配置参数
+            use_compression: 是否使用梯度压缩（Top-k稀疏化）
+            compression_rate: 压缩率（rate=50 表示保留 2% 的梯度）
 
         Returns:
-            如果不使用差分隐私：返回完整的模型参数字典
-            如果使用差分隐私：返回 (处理后的梯度, top-k索引, 梯度形状)
+            - 不使用任何技术：返回完整的模型参数字典
+            - 只使用压缩：返回 (稀疏梯度, top-k索引, 梯度形状)
+            - 使用DP（自动包含压缩+加噪）：返回 (处理后的梯度, top-k索引, 梯度形状)
         """
-        if not use_dp:
-            # 不使用差分隐私，直接返回模型参数
+        if not use_dp and not use_compression:
+            # 不使用任何技术，直接返回完整模型参数
             return copy.deepcopy(self.model.state_dict())
+
+        elif use_compression and not use_dp:
+            # 只使用压缩（Top-k），不加噪
+            return self._get_compressed_gradients(compression_rate)
+
         else:
-            # 使用差分隐私，返回处理后的梯度
+            # 使用差分隐私（自动包含压缩+裁剪+加噪）
             return self._get_private_gradients(dp_config)
 
     def _get_private_gradients(self, dp_config):
@@ -136,6 +144,45 @@ class Client:
         )
 
         return processed_gradient, choices, shapes
+
+
+    def _get_compressed_gradients(self, compression_rate):
+        """
+        计算并压缩梯度（只使用 Top-k 稀疏化，不加噪）
+
+        Args:
+            compression_rate: 压缩率（rate=50 表示保留 2% 的梯度）
+
+        Returns:
+            sparse_gradient: 稀疏梯度向量（未加噪）
+            choices: top-k 索引
+            shapes: 梯度形状列表
+        """
+        # 计算梯度（当前参数 - 初始参数）
+        gradients = []
+        current_params = self.model.state_dict()
+
+        for key in current_params.keys():
+            grad = current_params[key] - self.initial_params[key]
+            gradients.append(grad)
+
+        # 展平梯度
+        flattened_grad, shapes = Flatten_gradients(gradients)
+
+        # 只进行 Top-k 稀疏化，不加噪
+        dimension = flattened_grad.numel()
+        topk = int(dimension / compression_rate)
+
+        # 找出 top-k 索引
+        abs_grad = torch.abs(flattened_grad)
+        _, choices = torch.topk(abs_grad, topk)
+        choices = choices.tolist()
+
+        # 创建稀疏梯度向量（只保留 top-k 元素）
+        sparse_gradient = torch.zeros_like(flattened_grad)
+        sparse_gradient[choices] = flattened_grad[choices]
+
+        return sparse_gradient, choices, shapes
 
 
 class DPConfig:

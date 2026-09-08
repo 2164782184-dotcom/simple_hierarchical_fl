@@ -36,16 +36,17 @@ class EdgeServer:
             if client_id in self.clients:
                 self.clients[client_id].set_model(self.model)
 
-    def aggregate_client_models(self, client_models, client_weights, use_dp=False):
+    def aggregate_client_models(self, client_models, client_weights, use_dp=False, use_compression=False):
         """
-        聚合客户端模型参数（支持差分隐私 + 加权平均）
+        聚合客户端模型参数（支持差分隐私 + 加权平均 + 压缩）
 
         Args:
             client_models: 字典，key为客户端ID
-                         - 不使用DP：value为模型参数字典
-                         - 使用DP：value为 (梯度向量, top-k索引, 梯度形状) 元组
+                         - 不使用任何技术：value为模型参数字典
+                         - 使用压缩或DP：value为 (梯度向量, top-k索引, 梯度形状) 元组
             client_weights: 字典，key为客户端ID，value为权重（数据量）
             use_dp: 是否使用差分隐私
+            use_compression: 是否使用压缩
 
         Returns:
             聚合后的模型参数
@@ -53,12 +54,12 @@ class EdgeServer:
         if len(client_models) == 0:
             return self.model.state_dict()
 
-        if not use_dp:
-            # 标准FedAvg聚合（加权平均）
+        if not use_dp and not use_compression:
+            # 标准FedAvg聚合（加权平均，完整参数）
             return self._aggregate_standard(client_models, client_weights)
         else:
-            # 差分隐私聚合（加权平均）
-            return self._aggregate_with_dp(client_models, client_weights)
+            # 压缩或DP聚合（处理稀疏梯度）
+            return self._aggregate_with_compression(client_models, client_weights)
 
     def _aggregate_standard(self, client_models, client_weights):
         """
@@ -95,9 +96,10 @@ class EdgeServer:
 
         return aggregated_params
 
-    def _aggregate_with_dp(self, client_models, client_weights):
+    def _aggregate_with_compression(self, client_models, client_weights):
         """
-        差分隐私聚合（处理稀疏梯度 + 加权平均）
+        压缩/差分隐私聚合（处理稀疏梯度 + 加权平均）
+        适用于：只使用压缩 或 使用DP（DP自动包含压缩）
 
         Args:
             client_models: 字典，key为客户端ID，value为(梯度向量, top-k索引, 梯度形状)
