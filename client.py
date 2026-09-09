@@ -30,9 +30,10 @@ class Client:
         self.initial_params = copy.deepcopy(self.model.state_dict())
 
     def train(self, epochs, learning_rate, momentum=0, weight_decay=0,
-              lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None):
+              lr_decay=1.0, lr_decay_epoch=1, use_dp=False, dp_config=None,
+              mu=0.01):
         """
-        在本地数据上训练模型
+        在本地数据上训练模型（FedProx算法）
 
         Args:
             epochs: 本地训练轮数
@@ -43,6 +44,7 @@ class Client:
             lr_decay_epoch: 每多少轮衰减一次学习率
             use_dp: 是否使用差分隐私
             dp_config: 差分隐私配置参数
+            mu: FedProx近端项系数（0表示退化为FedAvg）
 
         Returns:
             avg_loss: 平均训练损失
@@ -62,6 +64,9 @@ class Client:
                                                      step_size=lr_decay_epoch,
                                                      gamma=lr_decay)
 
+        # FedProx: 保存全局模型参数（近端项的参考点）
+        global_params = copy.deepcopy(list(self.model.parameters()))
+
         total_loss = 0.0
 
         for epoch in range(epochs):
@@ -71,7 +76,17 @@ class Client:
 
                 optimizer.zero_grad()
                 output = self.model(data)
+
+                # 标准交叉熵损失
                 loss = criterion(output, target)
+
+                # FedProx近端项: (mu/2) * ||w - w_global||^2
+                if mu > 0:
+                    proximal_term = 0.0
+                    for local_param, global_param in zip(self.model.parameters(), global_params):
+                        proximal_term += torch.sum((local_param - global_param) ** 2)
+                    loss += (mu / 2) * proximal_term
+
                 loss.backward()
                 optimizer.step()
 
