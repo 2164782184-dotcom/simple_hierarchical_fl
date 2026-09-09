@@ -228,7 +228,7 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
     对选中的梯度元素进行采样随机化（差分隐私）
 
     流程：
-    1. 将梯度裁剪到 [-clip_C, clip_C]
+    1. 按 L2 范数裁剪梯度（保持方向，缩放大小）
     2. 将选中的元素归一化到 [left, right]
     3. 根据 mechanism 添加噪声（拉普拉斯或高斯）
     4. 反归一化回原始范围
@@ -237,7 +237,7 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
     Args:
         vector: 梯度向量
         choices: 被选中的索引列表
-        clip_C: 裁剪阈值
+        clip_C: 裁剪阈值（L2 范数上界）
         eps: 隐私预算 epsilon
         delta: 隐私参数 delta（高斯机制必须提供）
         mechanism: 噪声机制（'gaussian' 或 'laplace'）
@@ -254,8 +254,12 @@ def sampling_randomizer(vector, choices, clip_C, eps, delta, mechanism, device, 
     elif not isinstance(device, torch.device):
         device = torch.device('cpu')
 
-    # 步骤 1：梯度裁剪
-    vector = torch.clamp(vector, -clip_C, clip_C)
+    # 步骤 1：按 L2 范数裁剪梯度
+    # 计算梯度的 L2 范数
+    norm_2 = torch.norm(vector, p=2)
+    # 如果范数超过 clip_C，则缩放整个向量使其范数等于 clip_C
+    # 公式：clipped = vector * min(1, clip_C / ||vector||_2)
+    vector = vector / torch.max(norm_2 / clip_C, torch.tensor(1.0, device=device))
 
     # 初始化结果向量（全零）
     result = torch.zeros_like(vector)
