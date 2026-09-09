@@ -190,9 +190,51 @@ def topindex(updates, topk):
     return indices.tolist()
 
 
+def dp_process_full(flattened, args, device):
+    """
+    纯差分隐私处理：对所有梯度进行裁剪和加噪（不做Top-k稀疏化）
+
+    流程：
+    1. L2范数裁剪
+    2. 对所有元素加噪
+
+    Args:
+        flattened: 展平的梯度张量
+        args: 配置参数（epsilon, delta, clip_C, mechanism）
+        device: 计算设备
+
+    Returns:
+        noisy_gradient: 加噪后的完整梯度向量
+    """
+    # 确保 device 是 torch.device 对象
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif not isinstance(device, torch.device):
+        device = torch.device('cpu')
+
+    # 步骤1：L2范数裁剪
+    norm_2 = torch.norm(flattened, p=2)
+    clipped_gradient = flattened / torch.max(norm_2 / args.clip_C, torch.tensor(1.0, device=device))
+
+    # 步骤2：对所有元素加噪
+    if args.mechanism == 'gaussian':
+        # 高斯噪声：σ = clip_C * sqrt(2 * ln(1.25 / δ)) / ε
+        sigma = args.clip_C * math.sqrt(2 * math.log(1.25 / args.delta)) / args.epsilon
+        noise = torch.normal(0, sigma, size=clipped_gradient.shape).to(device)
+    elif args.mechanism == 'laplace':
+        # 拉普拉斯噪声：b = clip_C / ε
+        noise = torch.distributions.Laplace(0, args.clip_C / args.epsilon).sample(sample_shape=clipped_gradient.shape).to(device)
+    else:
+        raise ValueError(f"不支持的噪声机制: {args.mechanism}")
+
+    noisy_gradient = clipped_gradient + noise
+
+    return noisy_gradient
+
+
 def local_process(flattened, args, dimension, device):
     """
-    客户端本地处理：稀疏化 + 加噪
+    客户端本地处理：稀疏化 + 加噪（旧版本，保留用于兼容）
 
     流程：
     1. 计算 top-k 索引（稀疏化）

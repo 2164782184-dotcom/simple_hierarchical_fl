@@ -81,28 +81,45 @@ class CommunicationMetrics:
         计算稀疏梯度大小
 
         Args:
-            sparse_tuple: (gradient_vector, choices, shapes)
+            sparse_tuple: (gradient_data, choices, shapes)
+                         - 纯DP模式：choices=None，gradient_data是完整加噪梯度
+                         - 纯压缩模式：gradient_data只包含非零值，choices是索引
+                         - DP+压缩模式：gradient_data只包含非零值，choices是索引
 
         Returns:
             size_bits, size_mb, num_params
         """
-        gradient_vector, choices, shapes = sparse_tuple
+        gradient_data, choices, shapes = sparse_tuple
 
-        # 1. 非零梯度值的大小
-        non_zero_count = len(choices)
-        gradient_bits = non_zero_count * 32  # float32
+        # 计算完整梯度的总维度
+        total_dimension = sum(torch.prod(torch.tensor(shape)).item() for shape in shapes)
 
-        # 2. 索引的大小
-        # 假设使用 int32 存储索引
-        index_bits = non_zero_count * 32
+        if choices is None:
+            # 纯DP模式：传输完整的加噪梯度
+            gradient_bits = total_dimension * 32  # float32
+            index_bits = 0  # 不需要索引
+            transmitted_params = total_dimension
 
-        # 3. 形状信息的大小（可忽略不计）
-        shape_bits = len(shapes) * 32  # 每个维度用一个 int32
+        elif gradient_data.numel() == total_dimension:
+            # 旧版DP模式（兼容）：传输完整向量
+            gradient_bits = total_dimension * 32
+            index_bits = 0
+            transmitted_params = total_dimension
+
+        else:
+            # 压缩模式或DP+压缩模式：只传输非零值和索引
+            non_zero_count = len(choices)
+            gradient_bits = non_zero_count * 32  # float32，只传非零值
+            index_bits = non_zero_count * 32      # int32，传输索引位置
+            transmitted_params = non_zero_count
+
+        # 形状信息的大小（每个shape需要存储其维度数）
+        shape_bits = sum(len(shape) for shape in shapes) * 32
 
         total_bits = gradient_bits + index_bits + shape_bits
         size_mb = total_bits / (8 * 1024 * 1024)
 
-        return total_bits, size_mb, non_zero_count
+        return total_bits, size_mb, transmitted_params
 
     def record_client_upload(self, client_models):
         """

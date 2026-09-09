@@ -1,4 +1,5 @@
 import torch
+from sympy.abc import mu
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
@@ -31,6 +32,7 @@ def main():
     TRAIN_FRACTION = 0.01                 # 训练集的使用比例（0.3=使用30%数据）
     CLIENT_IID = False                    # 客户端数据是否IID分布
     EDGE_IID = True                       # 边缘服务器数据是否IID分布
+    MU = 0.01                             # MU等于0时，就是FedAvg，否则就是FedProx
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ==================== 差分隐私配置 ====================
@@ -79,7 +81,7 @@ def main():
     writer = None
     if USE_TENSORBOARD:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_dir = f'runs/HierFL_{"DP" if USE_DP else "noDP"}_{timestamp}'
+        log_dir = f"runs/Hier{'AVG' if MU==0 else 'Prox'}_DP={USE_DP}_Topk={USE_COMPRESSION}_{timestamp}"
         writer = SummaryWriter(log_dir)
         print(f"\n{'='*70}")
         print(f"TensorBoard 已启用")
@@ -179,7 +181,7 @@ def main():
 
                 # 训练
                 train_loss = client.train(LOCAL_EPOCHS, LEARNING_RATE, MOMENTUM, WEIGHT_DECAY, LR_DECAY, LR_DECAY_EPOCH,
-                                         use_dp=USE_DP, dp_config=dp_config)
+                                         use_dp=USE_DP, dp_config=dp_config, mu=MU)
 
                 # 获取模型参数（支持DP、压缩或完整参数）
                 client_models[client_id] = client.get_model_parameters(
@@ -281,7 +283,7 @@ def main():
     plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    filename = f'training_results_{"with_dp" if USE_DP else "without_dp"}.png'
+    filename = f'training_results_DP={USE_DP}_Topk={USE_COMPRESSION}.png'
     plt.savefig(filename, dpi=150)
     print(f"训练曲线已保存到 {filename}")
 

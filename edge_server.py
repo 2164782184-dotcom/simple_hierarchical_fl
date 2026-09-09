@@ -99,10 +99,14 @@ class EdgeServer:
     def _aggregate_with_compression(self, client_models, client_weights):
         """
         压缩/差分隐私聚合（处理稀疏梯度 + 加权平均）
-        适用于：只使用压缩 或 使用DP（DP自动包含压缩）
+
+        支持三种模式：
+        1. 纯DP模式：(完整加噪梯度, None, shapes)
+        2. 纯压缩模式：(非零值, choices, shapes)
+        3. DP+压缩模式：(非零值, choices, shapes)
 
         Args:
-            client_models: 字典，key为客户端ID，value为(梯度向量, top-k索引, 梯度形状)
+            client_models: 字典，key为客户端ID
             client_weights: 字典，key为客户端ID，value为权重（数据量）
 
         Returns:
@@ -110,20 +114,47 @@ class EdgeServer:
         """
         # 获取第一个客户端的梯度形状信息
         first_client_data = list(client_models.values())[0]
-        gradient_vector, _, shapes = first_client_data
+        gradient_data, choices, shapes = first_client_data
+
+        # 计算完整梯度的总维度
+        dimension = sum(torch.prod(torch.tensor(shape)).item() for shape in shapes)
+
+        # 判断模式
+        if choices is None:
+            # 纯DP模式：gradient_data是完整的加噪梯度
+            is_full_gradient = True
+        else:
+            # 压缩模式或DP+压缩模式：判断是否需要重建
+            is_full_gradient = (gradient_data.numel() == dimension)
 
         # 初始化聚合后的梯度向量（全零）
-        aggregated_gradient = torch.zeros_like(gradient_vector)
+        aggregated_gradient = torch.zeros(dimension, device=self.device)
 
         # 计算总权重
         total_weight = sum(client_weights.values())
 
         # 加权累加所有客户端的梯度
-        for client_id, (grad_vector, choices, _) in client_models.items():
+        for client_id, (gradient_data, choices, _) in client_models.items():
+            if choices is None:
+                # 纯DP模式：直接使用完整梯度
+                full_gradient = gradient_data.to(self.device)
+            elif is_full_gradient:
+                # DP模式（旧版本兼容）：已经是完整向量
+                full_gradient = gradient_data.to(self.device)
+            else:
+                # 压缩模式或DP+压缩模式：需要重建完整向量
+                if isinstance(choices, list):
+                    choices = torch.tensor(choices, dtype=torch.long, device=self.device)
+                else:
+                    choices = choices.to(self.device)
+
+                full_gradient = torch.zeros(dimension, device=self.device)
+                full_gradient[choices] = gradient_data.to(self.device)
+
             # 计算该客户端的权重占比
             weight = client_weights[client_id] / total_weight
             # 加权累加
-            aggregated_gradient += grad_vector * weight
+            aggregated_gradient += full_gradient * weight
 
         # 将展平的梯度重塑回原始形状
         gradient_list = reshape_gradients(aggregated_gradient, shapes)

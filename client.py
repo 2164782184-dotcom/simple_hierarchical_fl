@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import copy
-from privacy import Flatten_gradients, local_process, reshape_gradients
+from privacy import Flatten_gradients, dp_process_full, reshape_gradients, topindex
 
 
 class Client:
@@ -111,32 +111,38 @@ class Client:
             compression_rate: 压缩率（rate=50 表示保留 2% 的梯度）
 
         Returns:
-            - 不使用任何技术：返回完整的模型参数字典
-            - 只使用压缩：返回 (稀疏梯度, top-k索引, 梯度形状)
-            - 使用DP（自动包含压缩+加噪）：返回 (处理后的梯度, top-k索引, 梯度形状)
+            根据配置返回不同格式：
+            - 无DP无压缩：完整模型参数字典
+            - 只DP：(加噪后的完整梯度, None, 梯度形状)
+            - 只压缩：(非零值, top-k索引, 梯度形状)
+            - DP+压缩：(非零值, top-k索引, 梯度形状) - 先DP再Top-k
         """
         if not use_dp and not use_compression:
-            # 不使用任何技术，直接返回完整模型参数
+            # 场景1：不使用任何技术，直接返回完整模型参数
             return copy.deepcopy(self.model.state_dict())
 
+        elif use_dp and not use_compression:
+            # 场景2：只使用DP（对所有梯度加噪）
+            return self._get_dp_gradients(dp_config)
+
         elif use_compression and not use_dp:
-            # 只使用压缩（Top-k），不加噪
+            # 场景3：只使用压缩（Top-k），不加噪
             return self._get_compressed_gradients(compression_rate)
 
         else:
-            # 使用差分隐私（自动包含压缩+裁剪+加噪）
-            return self._get_private_gradients(dp_config)
+            # 场景4：DP + 压缩（先DP加噪，再Top-k选择）
+            return self._get_dp_then_compressed_gradients(dp_config, compression_rate)
 
-    def _get_private_gradients(self, dp_config):
+    def _get_dp_gradients(self, dp_config):
         """
-        计算并处理差分隐私梯度
+        纯差分隐私处理：对所有梯度加噪（不做Top-k）
 
         Args:
             dp_config: 差分隐私配置
 
         Returns:
-            processed_gradient: 处理后的梯度向量
-            choices: top-k 索引
+            noisy_gradient: 加噪后的完整梯度向量
+            None: 无索引（因为是完整梯度）
             shapes: 梯度形状列表
         """
         # 计算梯度（当前参数 - 初始参数）
@@ -150,15 +156,41 @@ class Client:
         # 展平梯度
         flattened_grad, shapes = Flatten_gradients(gradients)
 
-        # 应用差分隐私处理（裁剪 + 稀疏化 + 加噪）
-        dimension = flattened_grad.numel()
-        processed_gradient, choices = local_process(
-            flattened_grad,
-            dp_config,
-            dimension, self.device
-        )
+        # 纯DP处理：裁剪 + 加噪（不做Top-k）
+        noisy_gradient = dp_process_full(flattened_grad, dp_config, self.device)
 
-        return processed_gradient, choices, shapes
+        # 返回完整的加噪梯度
+        return noisy_gradient, None, shapes
+
+    def _get_dp_then_compressed_gradients(self, dp_config, compression_rate):
+        """
+        先DP加噪，再Top-k压缩
+
+        Args:
+            dp_config: 差分隐私配置
+            compression_rate: 压缩率
+
+        Returns:
+            non_zero_values: 选中的非零值
+            choices: top-k 索引
+            shapes: 梯度形状列表
+        """
+        # 步骤1：DP处理（得到加噪后的完整梯度）
+        noisy_gradient, _, shapes = self._get_dp_gradients(dp_config)
+
+        # 步骤2：Top-k选择
+        dimension = noisy_gradient.numel()
+        topk = int(dimension / compression_rate)
+
+        # 找出加噪后梯度中绝对值最大的top-k个
+        abs_grad = torch.abs(noisy_gradient)
+        _, choices = torch.topk(abs_grad, topk)
+        choices = choices.tolist()
+
+        # 只传输选中的值
+        non_zero_values = noisy_gradient[choices]
+
+        return non_zero_values, choices, shapes
 
 
     def _get_compressed_gradients(self, compression_rate):
@@ -169,7 +201,7 @@ class Client:
             compression_rate: 压缩率（rate=50 表示保留 2% 的梯度）
 
         Returns:
-            sparse_gradient: 稀疏梯度向量（未加噪）
+            non_zero_values: 只包含非零值的向量（压缩传输）
             choices: top-k 索引
             shapes: 梯度形状列表
         """
@@ -193,11 +225,10 @@ class Client:
         _, choices = torch.topk(abs_grad, topk)
         choices = choices.tolist()
 
-        # 创建稀疏梯度向量（只保留 top-k 元素）
-        sparse_gradient = torch.zeros_like(flattened_grad)
-        sparse_gradient[choices] = flattened_grad[choices]
+        # Top-k压缩：只上传选中的值及其位置
+        non_zero_values = flattened_grad[choices]
 
-        return sparse_gradient, choices, shapes
+        return non_zero_values, choices, shapes
 
 
 class DPConfig:
