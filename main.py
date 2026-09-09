@@ -37,7 +37,7 @@ def main():
     USE_DP = True                         # 是否使用差分隐私
     DP_EPSILON = 0.5                      # 隐私预算（越小隐私保护越强，典型值：0.1-10）
     DP_DELTA = 0.001                      # 失败概率（典型值：1e-5 到 1e-7）
-    DP_CLIP_C = 0.01                      # 梯度裁剪阈值
+    DP_CLIP_C = 0.1                      # 梯度裁剪阈值
     DP_RATE = 50                          # 稀疏化率（rate=50 表示保留 2% 的梯度）
     DP_MECHANISM = 'gaussian'              # 噪声机制（'laplace' 或 'gaussian'）
 
